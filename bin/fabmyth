@@ -1,0 +1,508 @@
+#!/usr/bin/env bash
+#
+# FaB-Myth-Ai  —  a friendly Ollama helper for Linux and Termux (Android)
+#
+# Run any downloadable model from the Ollama library on your device with a
+# single, memorable command. Handles install, the background server, model
+# downloads, chat, and diagnostics — with special care for Termux, where
+# getting Ollama going is usually the hard part.
+#
+#   fabmyth setup              install Ollama for this platform
+#   fabmyth start | stop       manage the background server
+#   fabmyth pull <model>       download a model
+#   fabmyth run  <model>       chat with a model (interactive)
+#   fabmyth chat               pick an installed model and chat
+#   fabmyth list               show installed models
+#   fabmyth search [term]      browse popular models from the library
+#   fabmyth doctor             diagnose your environment
+#
+# MIT License — Copyright (c) 2026 Trey16885
+set -euo pipefail
+
+FABMYTH_VERSION="0.1.0"
+
+# ---------------------------------------------------------------------------
+# Colors (disabled when not a TTY or NO_COLOR is set)
+# ---------------------------------------------------------------------------
+if [ -t 1 ] && [ -z "${NO_COLOR:-}" ]; then
+  C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'
+  C_RED=$'\033[31m'; C_GREEN=$'\033[32m'; C_YELLOW=$'\033[33m'
+  C_BLUE=$'\033[34m'; C_CYAN=$'\033[36m'
+else
+  C_RESET=; C_BOLD=; C_DIM=; C_RED=; C_GREEN=; C_YELLOW=; C_BLUE=; C_CYAN=
+fi
+
+say()   { printf '%s\n' "$*"; }
+info()  { printf '%s==>%s %s\n' "$C_CYAN$C_BOLD" "$C_RESET" "$*"; }
+ok()    { printf '%s✔%s %s\n'  "$C_GREEN" "$C_RESET" "$*"; }
+warn()  { printf '%s!%s %s\n'  "$C_YELLOW" "$C_RESET" "$*" >&2; }
+err()   { printf '%s\342\234\227%s %s\n'  "$C_RED" "$C_RESET" "$*" >&2; }
+die()   { err "$*"; exit 1; }
+have()  { command -v "$1" >/dev/null 2>&1; }
+
+# ---------------------------------------------------------------------------
+# Paths / environment
+# ---------------------------------------------------------------------------
+FABMYTH_HOME="${FABMYTH_HOME:-$HOME/.fabmyth}"
+PID_FILE="$FABMYTH_HOME/ollama.pid"
+LOG_FILE="$FABMYTH_HOME/ollama.log"
+OLLAMA_HOST_DEFAULT="127.0.0.1:11434"
+export OLLAMA_HOST="${OLLAMA_HOST:-$OLLAMA_HOST_DEFAULT}"
+
+mkdir -p "$FABMYTH_HOME"
+
+# ---------------------------------------------------------------------------
+# Platform detection
+# ---------------------------------------------------------------------------
+IS_TERMUX=0
+if [ -n "${TERMUX_VERSION:-}" ]; then
+  IS_TERMUX=1
+elif printf '%s' "${PREFIX:-}" | grep -q "com.termux"; then
+  IS_TERMUX=1
+elif have termux-setup-storage; then
+  IS_TERMUX=1
+fi
+
+detect_arch() {
+  case "$(uname -m)" in
+    x86_64|amd64)          echo "amd64" ;;
+    aarch64|arm64)         echo "arm64" ;;
+    armv7l|armv8l|arm)     echo "arm" ;;
+    *)                     echo "$(uname -m)" ;;
+  esac
+}
+
+platform_label() {
+  if [ "$IS_TERMUX" = 1 ]; then
+    printf 'Termux (Android, %s)' "$(detect_arch)"
+  else
+    printf 'Linux (%s)' "$(detect_arch)"
+  fi
+}
+
+# ---------------------------------------------------------------------------
+# Server / API helpers
+# ---------------------------------------------------------------------------
+api_url() { printf 'http://%s' "$OLLAMA_HOST"; }
+
+server_up() {
+  curl -fsS --max-time 3 "$(api_url)/api/version" >/dev/null 2>&1
+}
+
+running_pid() {
+  if [ -f "$PID_FILE" ]; then
+    local pid; pid="$(cat "$PID_FILE" 2>/dev/null || true)"
+    if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+      printf '%s' "$pid"; return 0
+    fi
+  fi
+  return 1
+}
+
+ensure_ollama() {
+  have ollama || die "Ollama isn't installed yet. Run: ${C_BOLD}fabmyth setup${C_RESET}"
+}
+
+ensure_server() {
+  ensure_ollama
+  if server_up; then return 0; fi
+  info "Ollama server isn't responding — starting it…"
+  cmd_start
+  local i
+  for i in $(seq 1 30); do
+    server_up && { ok "Server is up."; return 0; }
+    sleep 1
+  done
+  die "Server did not come up. Check the log: $LOG_FILE"
+}
+
+# ---------------------------------------------------------------------------
+# Commands
+# ---------------------------------------------------------------------------
+cmd_setup() {
+  info "Setting up Ollama for: $(platform_label)"
+
+  if have ollama; then
+    ok "Ollama is already installed ($(ollama --version 2>/dev/null | head -1))."
+    return 0
+  fi
+
+  if [ "$IS_TERMUX" = 1 ]; then
+    setup_termux
+  else
+    setup_linux
+  fi
+}
+
+setup_termux() {
+  info "Termux detected. Installing via pkg…"
+  if ! have pkg; then
+    die "This looks like Termux but 'pkg' is missing. Install Termux from F-Droid."
+  fi
+  # Termux keeps Ollama in its repos on most modern installs.
+  pkg update -y || warn "pkg update reported an issue — continuing."
+  if pkg install -y ollama; then
+    ok "Ollama installed via pkg."
+  else
+    warn "'pkg install ollama' failed. Falling back to a proot-distro guide."
+    cat <<'EOF'
+
+  Your Termux repo doesn't have an Ollama package. The reliable path is a
+  small Linux distro inside Termux via proot-distro:
+
+    pkg install -y proot-distro
+    proot-distro install debian
+    proot-distro login debian -- bash -c \
+      'curl -fsSL https://ollama.com/install.sh | sh'
+
+  Then run this helper from *inside* the debian shell:
+    proot-distro login debian
+    fabmyth start
+
+  See docs/TERMUX.md for the full walkthrough.
+EOF
+    return 1
+  fi
+}
+
+setup_linux() {
+  local arch; arch="$(detect_arch)"
+  info "Installing Ollama for Linux/$arch…"
+
+  # Preferred: official installer (handles systemd + PATH when root is available).
+  if have curl; then
+    if [ "$(id -u)" = "0" ] || have sudo; then
+      info "Using the official Ollama install script."
+      curl -fsSL https://ollama.com/install.sh | sh && { ok "Ollama installed."; return 0; }
+      warn "Official installer failed — trying a userspace binary install."
+    fi
+    install_binary_userspace "$arch" && return 0
+  fi
+  die "Couldn't install Ollama automatically. See https://ollama.com/download"
+}
+
+# Root-free install: drop the static binary into ~/.local/bin
+install_binary_userspace() {
+  local arch="$1"
+  local dest="$HOME/.local/bin"
+  local url="https://ollama.com/download/ollama-linux-${arch}.tgz"
+  mkdir -p "$dest"
+  info "Downloading userspace binary → $dest"
+  local tmp; tmp="$(mktemp -d)"
+  if curl -fsSL "$url" -o "$tmp/ollama.tgz"; then
+    tar -xzf "$tmp/ollama.tgz" -C "$tmp" 2>/dev/null || true
+    if [ -f "$tmp/bin/ollama" ]; then
+      install -m 0755 "$tmp/bin/ollama" "$dest/ollama"
+    elif [ -f "$tmp/ollama" ]; then
+      install -m 0755 "$tmp/ollama" "$dest/ollama"
+    else
+      rm -rf "$tmp"; return 1
+    fi
+    rm -rf "$tmp"
+    ok "Installed to $dest/ollama"
+    case ":$PATH:" in
+      *":$dest:"*) : ;;
+      *) warn "Add this to your shell profile:  export PATH=\"\$HOME/.local/bin:\$PATH\"" ;;
+    esac
+    return 0
+  fi
+  rm -rf "$tmp"; return 1
+}
+
+cmd_start() {
+  ensure_ollama
+  if running_pid >/dev/null; then
+    ok "Server already running (pid $(running_pid))."
+    return 0
+  fi
+  if server_up; then
+    ok "An Ollama server is already listening on $OLLAMA_HOST."
+    return 0
+  fi
+  info "Starting Ollama server (host $OLLAMA_HOST)…"
+  : > "$LOG_FILE"
+  # Run in its own session/process group so `stop` can reap the whole tree,
+  # even when the server spawns child processes.
+  if have setsid; then
+    setsid ollama serve >>"$LOG_FILE" 2>&1 &
+  else
+    nohup ollama serve >>"$LOG_FILE" 2>&1 &
+  fi
+  echo $! > "$PID_FILE"
+  local i
+  for i in $(seq 1 30); do
+    server_up && { ok "Server ready → $(api_url)  (logs: $LOG_FILE)"; return 0; }
+    sleep 1
+  done
+  err "Server started (pid $(cat "$PID_FILE")) but isn't answering yet. Tail the log:"
+  say "  tail -f $LOG_FILE"
+  return 1
+}
+
+cmd_stop() {
+  local pid
+  if pid="$(running_pid)"; then
+    info "Stopping Ollama server (pid $pid)…"
+    # Try to terminate the whole process group (pid is the group leader when
+    # started with setsid); fall back to the single pid.
+    kill -TERM "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null || true
+    sleep 1
+    if kill -0 "$pid" 2>/dev/null; then
+      kill -KILL "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null || true
+    fi
+    rm -f "$PID_FILE"
+    ok "Stopped."
+  else
+    rm -f "$PID_FILE"
+    warn "No server was started by fabmyth."
+    if server_up; then
+      warn "But something is still listening on $OLLAMA_HOST (started outside fabmyth)."
+    fi
+  fi
+}
+
+cmd_status() {
+  info "FaB-Myth-Ai status"
+  say "  Platform : $(platform_label)"
+  say "  Host     : $OLLAMA_HOST"
+  if have ollama; then
+    say "  Ollama   : ${C_GREEN}installed${C_RESET} ($(ollama --version 2>/dev/null | head -1))"
+  else
+    say "  Ollama   : ${C_RED}not installed${C_RESET}  (run: fabmyth setup)"
+  fi
+  if server_up; then
+    local ver; ver="$(curl -fsS --max-time 3 "$(api_url)/api/version" 2>/dev/null | jq -r '.version' 2>/dev/null || echo '?')"
+    say "  Server   : ${C_GREEN}up${C_RESET} (api v$ver)"
+  else
+    say "  Server   : ${C_YELLOW}down${C_RESET}  (run: fabmyth start)"
+  fi
+  local pid
+  if pid="$(running_pid)"; then
+    say "  PID      : $pid  (managed by fabmyth)"
+  fi
+}
+
+cmd_pull() {
+  [ $# -ge 1 ] || die "Usage: fabmyth pull <model>   (e.g. fabmyth pull llama3.2:1b)"
+  ensure_server
+  info "Downloading '$1' — this can take a while on mobile data."
+  ollama pull "$@"
+}
+
+cmd_run() {
+  [ $# -ge 1 ] || die "Usage: fabmyth run <model> [prompt]"
+  ensure_server
+  local model="$1"; shift
+  if ! ollama list 2>/dev/null | awk 'NR>1{print $1}' | grep -qx "$model"; then
+    warn "'$model' isn't installed locally. Pulling it first…"
+    ollama pull "$model"
+  fi
+  ollama run "$model" "$@"
+}
+
+cmd_chat() {
+  ensure_server
+  local models
+  models="$(ollama list 2>/dev/null | awk 'NR>1{print $1}')"
+  if [ -z "$models" ]; then
+    warn "No models installed yet."
+    say  "Try:  fabmyth search      then   fabmyth pull <model>"
+    return 1
+  fi
+  info "Installed models:"
+  local i=1; local arr=()
+  while IFS= read -r m; do
+    [ -n "$m" ] || continue
+    arr+=("$m"); printf '  %s%2d%s  %s\n' "$C_BOLD" "$i" "$C_RESET" "$m"; i=$((i+1))
+  done <<< "$models"
+  printf '%sPick a number (or type a model name):%s ' "$C_CYAN" "$C_RESET"
+  read -r choice
+  local model
+  if printf '%s' "$choice" | grep -qE '^[0-9]+$' && [ "$choice" -ge 1 ] && [ "$choice" -le "${#arr[@]}" ]; then
+    model="${arr[$((choice-1))]}"
+  else
+    model="$choice"
+  fi
+  [ -n "$model" ] || die "No model selected."
+  info "Starting chat with $model  (type /bye to quit)"
+  ollama run "$model"
+}
+
+cmd_list() {
+  ensure_server
+  ollama list
+}
+
+cmd_ps() {
+  ensure_server
+  ollama ps
+}
+
+cmd_rm() {
+  [ $# -ge 1 ] || die "Usage: fabmyth rm <model>"
+  ensure_ollama
+  ollama rm "$@"
+}
+
+# Curated slice of the Ollama library, biased toward models that actually fit
+# on a phone. Sizes are approximate download sizes.
+cmd_search() {
+  local term="${1:-}"
+  info "Popular Ollama models  (★ = comfortable on most phones)"
+  printf '%s\n' "${C_DIM}Browse the full library at https://ollama.com/library${C_RESET}"
+  say ""
+  local catalog="\
+llama3.2:1b|★|~1.3GB|Tiny, fast general chat — great first model on Termux
+llama3.2:3b|★|~2.0GB|Small general chat with solid quality
+qwen2.5:0.5b|★|~0.4GB|Ultra-light, runs almost anywhere
+qwen2.5:1.5b|★|~1.0GB|Light general model, strong for its size
+qwen2.5:3b|★|~1.9GB|Well-rounded small model
+gemma2:2b|★|~1.6GB|Google's compact model, good instruction following
+phi3:mini|★|~2.3GB|Microsoft Phi-3, strong reasoning for size
+smollm2:1.7b|★|~1.0GB|Efficient small model, good on low RAM
+tinyllama|★|~0.6GB|Very small, fine for demos and testing
+deepseek-r1:1.5b|★|~1.1GB|Small reasoning model with step-by-step thinking
+codegemma:2b|★|~1.6GB|Compact code-completion model
+llama3.1:8b||~4.7GB|Higher quality, needs a beefier device
+mistral:7b||~4.1GB|Popular 7B general model
+qwen2.5-coder:7b||~4.7GB|Strong coding assistant
+deepseek-r1:7b||~4.7GB|Reasoning model, larger variant
+llava:7b||~4.5GB|Vision + language (describe images)"
+
+  local shown=0
+  while IFS='|' read -r name star size desc; do
+    [ -n "$name" ] || continue
+    if [ -n "$term" ] && ! printf '%s %s' "$name" "$desc" | grep -qi -- "$term"; then
+      continue
+    fi
+    local star_disp="  "
+    [ -n "$star" ] && star_disp="${C_GREEN}★${C_RESET}"
+    printf '  %s%-18s%s %s %-7s %s%s%s\n' \
+      "$C_BOLD" "$name" "$C_RESET" \
+      "$star_disp" \
+      "$size" "$C_DIM" "$desc" "$C_RESET"
+    shown=$((shown+1))
+  done <<< "$catalog"
+
+  [ "$shown" = 0 ] && warn "No catalog entries matched '$term'. Try the full library link above."
+  say ""
+  say "Install one with:  ${C_BOLD}fabmyth pull <model>${C_RESET}"
+}
+
+cmd_logs() {
+  [ -f "$LOG_FILE" ] || die "No log yet at $LOG_FILE (start the server first)."
+  if [ "${1:-}" = "-f" ]; then tail -f "$LOG_FILE"; else tail -n "${1:-50}" "$LOG_FILE"; fi
+}
+
+cmd_doctor() {
+  info "FaB-Myth-Ai doctor — $(platform_label)"
+  local issues=0
+
+  check() { # check "label" "status(ok|warn|fail)" "detail"
+    local label="$1" st="$2" detail="${3:-}"
+    case "$st" in
+      ok)   printf '  %s✔%s %-22s %s\n' "$C_GREEN" "$C_RESET" "$label" "$detail" ;;
+      warn) printf '  %s!%s %-22s %s\n' "$C_YELLOW" "$C_RESET" "$label" "$detail"; issues=$((issues+1)) ;;
+      fail) printf '  %s✘%s %-22s %s\n' "$C_RED" "$C_RESET" "$label" "$detail"; issues=$((issues+1)) ;;
+    esac
+  }
+
+  have curl && check "curl" ok || check "curl" fail "required — install it"
+  have tar  && check "tar"  ok || check "tar"  warn "needed for userspace install"
+  have jq   && check "jq"   ok || check "jq"   warn "optional, nicer status output"
+
+  if have ollama; then
+    check "ollama" ok "$(ollama --version 2>/dev/null | head -1)"
+  else
+    check "ollama" fail "run: fabmyth setup"
+  fi
+
+  if server_up; then check "server" ok "$(api_url)"; else check "server" warn "down — run: fabmyth start"; fi
+
+  # Memory hint (Termux especially)
+  local mem_kb mem_gb
+  if [ -r /proc/meminfo ]; then
+    mem_kb="$(awk '/MemTotal/{print $2}' /proc/meminfo 2>/dev/null || echo 0)"
+    mem_gb=$(( mem_kb / 1024 / 1024 ))
+    if [ "$mem_gb" -ge 4 ]; then
+      check "RAM" ok "${mem_gb}GB — 3B+ models are fine"
+    elif [ "$mem_gb" -ge 2 ]; then
+      check "RAM" warn "${mem_gb}GB — stick to 1–3B models (see: fabmyth search)"
+    else
+      check "RAM" warn "${mem_gb}GB — try the ★ tiny models only (qwen2.5:0.5b)"
+    fi
+  fi
+
+  say ""
+  if [ "$issues" = 0 ]; then
+    ok "Everything looks good. Try:  fabmyth pull llama3.2:1b  &&  fabmyth chat"
+  else
+    warn "$issues item(s) need attention above."
+  fi
+}
+
+cmd_version() { say "FaB-Myth-Ai (fabmyth) v$FABMYTH_VERSION"; }
+
+cmd_help() {
+  cat <<EOF
+${C_BOLD}FaB-Myth-Ai${C_RESET} — run any Ollama model on your device (built for Linux & Termux)
+
+${C_BOLD}Usage:${C_RESET} fabmyth <command> [args]
+
+${C_BOLD}Getting started${C_RESET}
+  setup                 Install Ollama for this platform (Termux or Linux)
+  start                 Start the Ollama server in the background
+  stop                  Stop the background server
+  status                Show install / server / platform status
+  doctor                Diagnose your environment and give hints
+
+${C_BOLD}Models${C_RESET}
+  search [term]         Browse popular models (★ = phone-friendly)
+  pull <model>          Download a model (e.g. llama3.2:1b)
+  run <model> [prompt]  Chat with a model (auto-pulls if missing)
+  chat                  Pick an installed model and start chatting
+  list                  List installed models
+  ps                    Show currently running models
+  rm <model>            Remove an installed model
+
+${C_BOLD}Other${C_RESET}
+  logs [-f|N]           Show server logs (-f to follow, N lines)
+  version               Print version
+  help                  This message
+
+${C_BOLD}Quick start${C_RESET}
+  fabmyth setup && fabmyth start
+  fabmyth pull llama3.2:1b
+  fabmyth chat
+
+Env: OLLAMA_HOST (default $OLLAMA_HOST_DEFAULT), FABMYTH_HOME ($FABMYTH_HOME)
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# Dispatch
+# ---------------------------------------------------------------------------
+main() {
+  local cmd="${1:-help}"; shift || true
+  case "$cmd" in
+    setup|install)     cmd_setup "$@" ;;
+    start|serve)       cmd_start "$@" ;;
+    stop)              cmd_stop "$@" ;;
+    status)            cmd_status "$@" ;;
+    restart)           cmd_stop || true; cmd_start "$@" ;;
+    pull|download)     cmd_pull "$@" ;;
+    run)               cmd_run "$@" ;;
+    chat)              cmd_chat "$@" ;;
+    list|ls)           cmd_list "$@" ;;
+    ps)                cmd_ps "$@" ;;
+    rm|remove)         cmd_rm "$@" ;;
+    search|browse)     cmd_search "$@" ;;
+    logs|log)          cmd_logs "$@" ;;
+    doctor)            cmd_doctor "$@" ;;
+    version|--version|-v) cmd_version ;;
+    help|--help|-h)    cmd_help ;;
+    *) err "Unknown command: $cmd"; say ""; cmd_help; exit 1 ;;
+  esac
+}
+
+main "$@"

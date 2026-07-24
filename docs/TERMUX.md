@@ -1,0 +1,116 @@
+# Running FaB-Myth-Ai on Termux (Android)
+
+Termux lets you run a real Linux userland on your phone, which means you can run
+Ollama models locally — no cloud, no account, fully offline once downloaded.
+This guide covers the two supported paths and the gotchas unique to Android.
+
+> **TL;DR**
+> ```bash
+> pkg install -y curl
+> curl -fsSL https://raw.githubusercontent.com/Trey16885/FaB-Myth-Ai/main/install.sh | bash
+> fabmyth setup
+> fabmyth start
+> fabmyth pull llama3.2:1b
+> fabmyth chat
+> ```
+
+---
+
+## 0. Install Termux the right way
+
+Install Termux from **F-Droid** or **GitHub**, *not* the Play Store version
+(that one is outdated and won't update its packages).
+
+Then bootstrap the basics:
+
+```bash
+pkg update -y && pkg upgrade -y
+pkg install -y curl
+```
+
+## 1. Install the helper
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Trey16885/FaB-Myth-Ai/main/install.sh | bash
+```
+
+On Termux this drops `fabmyth` into `$PREFIX/bin`, which is already on your PATH.
+
+## 2. Install Ollama
+
+```bash
+fabmyth setup
+```
+
+`fabmyth setup` first tries `pkg install ollama` (available in current Termux
+repos). If your repo doesn't carry it, the command prints the **proot-distro**
+fallback (see below).
+
+### Fallback: proot-distro
+
+Some Termux setups don't have an Ollama package. In that case run a tiny Debian
+inside Termux and install Ollama there:
+
+```bash
+pkg install -y proot-distro
+proot-distro install debian
+proot-distro login debian
+# --- now you're inside Debian ---
+apt update && apt install -y curl
+curl -fsSL https://ollama.com/install.sh | sh
+```
+
+Install the helper inside Debian too, then use it normally:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Trey16885/FaB-Myth-Ai/main/install.sh | bash
+fabmyth start
+```
+
+Remember: when you use proot, you must be **inside** the Debian shell
+(`proot-distro login debian`) every time you want to run models.
+
+## 3. Start the server and pull a model
+
+```bash
+fabmyth start
+fabmyth search          # pick a ★ phone-friendly model
+fabmyth pull llama3.2:1b
+fabmyth chat            # choose it and start chatting
+```
+
+---
+
+## Picking a model your phone can handle
+
+Phones are RAM-constrained. `fabmyth doctor` reads your available RAM and tells
+you what's safe. Rough guide:
+
+| Phone RAM | Comfortable models                  |
+|-----------|-------------------------------------|
+| 3 GB      | `qwen2.5:0.5b`, `tinyllama`         |
+| 4 GB      | `llama3.2:1b`, `qwen2.5:1.5b`       |
+| 6 GB      | `llama3.2:3b`, `gemma2:2b`, `phi3:mini` |
+| 8 GB+     | `qwen2.5:3b`, small 7B models (slow) |
+
+Models download over your network — grab them on Wi-Fi, not mobile data.
+
+## Keeping it running
+
+- **Prevent Android from killing Termux:** acquire a wakelock with
+  `termux-wake-lock` (from the Termux notification, tap "Acquire wakelock"), and
+  disable battery optimization for Termux in Android settings.
+- **Free storage:** models live under `~/.ollama/models`. Remove ones you don't
+  use with `fabmyth rm <model>`.
+
+## Troubleshooting
+
+| Symptom | Fix |
+|---|---|
+| `Ollama isn't installed` | Run `fabmyth setup`. If it fails, use the proot-distro path. |
+| Server won't come up | `fabmyth logs -f` to see why; often it's low memory. |
+| `killed` mid-chat | Model is too big for your RAM — pick a smaller ★ model. |
+| Very slow responses | Normal on phones; smaller models respond faster. |
+| Command not found after install | Add the printed `export PATH=...` line to `~/.bashrc`. |
+
+Run `fabmyth doctor` any time to get a health check tailored to your device.
