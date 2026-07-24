@@ -19,7 +19,7 @@
 # MIT License — Copyright (c) 2026 Trey16885
 set -euo pipefail
 
-FABMYTH_VERSION="0.1.0"
+FABMYTH_VERSION="0.4.0"
 
 # ---------------------------------------------------------------------------
 # Colors (disabled when not a TTY or NO_COLOR is set)
@@ -48,6 +48,9 @@ PID_FILE="$FABMYTH_HOME/ollama.pid"
 LOG_FILE="$FABMYTH_HOME/ollama.log"
 OLLAMA_HOST_DEFAULT="127.0.0.1:11434"
 export OLLAMA_HOST="${OLLAMA_HOST:-$OLLAMA_HOST_DEFAULT}"
+
+# Where `fabmyth update` fetches new versions from (override for testing/forks).
+FABMYTH_REPO_RAW="${FABMYTH_REPO_RAW:-https://raw.githubusercontent.com/Trey16885/FaB-Myth-Ai}"
 
 mkdir -p "$FABMYTH_HOME"
 
@@ -328,6 +331,509 @@ cmd_chat() {
   ollama run "$model"
 }
 
+# ---------------------------------------------------------------------------
+# Termux AgenticOS — let the model take actions on the device, with consent
+# ---------------------------------------------------------------------------
+cmd_agent() {
+  [ $# -ge 1 ] || die "Usage: fabmyth agent <model> [initial task]   (e.g. fabmyth agent llama3.2:3b \"list my downloads\")"
+  ensure_server
+  local model="$1"; shift
+
+  local PYBIN
+  if have python3; then PYBIN=python3
+  elif have python; then PYBIN=python
+  else die "AgenticOS needs Python. Install it:  pkg install python  (Termux)  |  apt install python3 (Debian)"
+  fi
+
+  if ! ollama list 2>/dev/null | awk 'NR>1{print $1}' | grep -qx "$model"; then
+    warn "'$model' isn't installed. Pulling it first…"
+    ollama pull "$model" || die "Could not pull $model"
+  fi
+
+  # Write the embedded agent to disk so its stdin stays connected to the
+  # terminal (needed for the per-action consent prompts).
+  local agent_py="$FABMYTH_HOME/agentic.py"
+  cat > "$agent_py" <<'PYEOF'
+#!/usr/bin/env python3
+"""FaB-Myth AgenticOS: a consent-gated agent loop over any Ollama model.
+
+The model can act on the device by emitting fenced blocks tagged 'fabmyth-*'.
+Only those tagged blocks ever run, and only after the user approves each one.
+Files it creates land under  <storage>/FabMyth/<ModelName>/ .
+"""
+import os, sys, re, json, subprocess, tempfile
+import urllib.request, urllib.error
+
+HOST = os.environ.get("OLLAMA_HOST", "127.0.0.1:11434")
+BASE = HOST if HOST.startswith("http") else "http://" + HOST
+PYBIN = os.environ.get("FABMYTH_PY", "python3")
+
+TTY = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+def _c(x): return x if TTY else ""
+R=_c("\033[0m"); B=_c("\033[1m"); DIM=_c("\033[2m")
+RED=_c("\033[31m"); GRN=_c("\033[32m"); YEL=_c("\033[33m"); CYN=_c("\033[36m"); MAG=_c("\033[35m")
+
+MODEL = sys.argv[1] if len(sys.argv) > 1 else "llama3.2:3b"
+INIT  = " ".join(sys.argv[2:]).strip()
+
+def safe_name(m): return re.sub(r"[^A-Za-z0-9._-]", "_", m)
+
+def storage_base():
+    env = os.environ.get("FABMYTH_STORAGE")
+    if env: return env
+    for p in ("/sdcard", "/storage/emulated/0"):
+        if os.path.isdir(p): return p
+    return os.path.expanduser("~")
+
+WORKSPACE = os.path.join(storage_base(), "FabMyth", safe_name(MODEL))
+try:
+    os.makedirs(WORKSPACE, exist_ok=True)
+except PermissionError:
+    sys.stderr.write(
+        "Cannot create %s\nOn Termux, run:  termux-setup-storage  (then grant "
+        "storage permission), or set FABMYTH_STORAGE to a writable path.\n" % WORKSPACE)
+    sys.exit(1)
+
+SYSTEM = (
+    "You are FaB-Myth AgenticOS, an AI agent running on the user's device via "
+    "Termux/Linux. You can take real actions by emitting fenced code blocks with "
+    "one of these exact info tags. ONLY blocks with a 'fabmyth-' tag are executed, "
+    "and the user must approve every one before it runs.\n\n"
+    "Run a shell command:\n```fabmyth-sh\nls -la\n```\n\n"
+    "Run Python:\n```fabmyth-py\nprint('hi')\n```\n\n"
+    "Run JavaScript (Node.js):\n```fabmyth-js\nconsole.log('hi')\n```\n\n"
+    "Save a file (relative path, stored in your workspace):\n"
+    "```fabmyth-save notes.txt\nfile contents\n```\n\n"
+    "Rules:\n"
+    "- Emit a fabmyth- block ONLY when you actually want to run or save something; "
+    "otherwise just reply in plain text.\n"
+    "- After each action you receive its output in a message starting with [fabmyth]. "
+    "Use it to decide the next step.\n"
+    "- Your working directory IS the workspace folder; files you create stay there.\n"
+    "- Prefer small, safe commands. Never try to bypass the approval step.\n"
+    "- When the task is done, give a short plain-text summary with no action block.\n"
+    "Your workspace: " + WORKSPACE
+)
+
+ACTION_RE = re.compile(r"```fabmyth-([A-Za-z]+)[ \t]*([^\n]*)\n(.*?)```", re.DOTALL)
+SYNONYMS = {"sh":"shell","shell":"shell","bash":"shell",
+            "py":"python","python":"python",
+            "js":"js","javascript":"js","node":"js",
+            "save":"save","file":"save","write":"save"}
+
+def parse_actions(text):
+    out = []
+    for m in ACTION_RE.finditer(text):
+        kind = SYNONYMS.get(m.group(1).lower().strip())
+        if kind:
+            out.append((kind, m.group(2).strip(), m.group(3)))
+    return out
+
+MAXOUT = 6000
+def clip(s):
+    return s if len(s) <= MAXOUT else s[:MAXOUT] + "\n...[truncated %d chars]" % (len(s) - MAXOUT)
+
+def run_shell(body):
+    try:
+        p = subprocess.run(["bash","-c",body], cwd=WORKSPACE, capture_output=True,
+                           text=True, timeout=300)
+    except subprocess.TimeoutExpired:
+        return 124, "timed out after 300s"
+    out = p.stdout or ""
+    if p.stderr: out += "\n[stderr]\n" + p.stderr
+    return p.returncode, clip(out.strip())
+
+def run_code(kind, body):
+    suffix = ".py" if kind == "python" else ".js"
+    interp = [PYBIN] if kind == "python" else ["node"]
+    fd, path = tempfile.mkstemp(suffix=suffix, prefix="fabmyth_")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(body)
+        try:
+            p = subprocess.run(interp + [path], cwd=WORKSPACE, capture_output=True,
+                               text=True, timeout=300)
+        except FileNotFoundError:
+            pkg = "python" if kind == "python" else "nodejs"
+            return 127, "%s is not installed. Install it:  pkg install %s" % (interp[0], pkg)
+        except subprocess.TimeoutExpired:
+            return 124, "timed out after 300s"
+        out = p.stdout or ""
+        if p.stderr: out += "\n[stderr]\n" + p.stderr
+        return p.returncode, clip(out.strip())
+    finally:
+        try: os.remove(path)
+        except OSError: pass
+
+def save_file(arg, body):
+    name = arg.strip().strip('"').strip("'")
+    if not name:
+        return False, "no filename given"
+    if os.path.isabs(name) or ".." in name.split("/"):
+        return False, "refused unsafe path: " + name
+    dest = os.path.realpath(os.path.join(WORKSPACE, name))
+    root = os.path.realpath(WORKSPACE)
+    if not (dest == root or dest.startswith(root + os.sep)):
+        return False, "refused path outside workspace"
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    with open(dest, "w") as f:
+        f.write(body)
+    return True, dest
+
+ALLOW_ALL = False
+LABEL = {"shell":"RUN SHELL","python":"RUN PYTHON","js":"RUN JAVASCRIPT","save":"SAVE FILE"}
+
+def consent(kind, arg, body):
+    global ALLOW_ALL
+    print()
+    print("%s>> %s %s%s" % (YEL + B, LABEL[kind], arg if kind == "save" else "", R))
+    print(DIM + "-" * 52 + R)
+    print(body.rstrip("\n"))
+    print(DIM + "-" * 52 + R)
+    if ALLOW_ALL:
+        print(GRN + "[auto-approved]" + R)
+        return True
+    try:
+        ans = input("%sApprove? [y]es / [N]o / [a]ll this session / [q]uit: %s" % (CYN, R)).strip().lower()
+    except EOFError:
+        return False
+    if ans == "q":
+        print("Quitting AgenticOS.")
+        sys.exit(0)
+    if ans == "a":
+        ALLOW_ALL = True
+        return True
+    return ans in ("y", "yes")
+
+def chat(messages):
+    data = json.dumps({"model": MODEL, "messages": messages, "stream": False}).encode()
+    req = urllib.request.Request(BASE + "/api/chat", data=data,
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=600) as r:
+        return json.loads(r.read().decode())["message"]["content"]
+
+def main():
+    print("%sFaB-Myth AgenticOS%s  model=%s" % (B + MAG, R, MODEL))
+    print("  workspace : %s" % WORKSPACE)
+    print("  %severy action needs your approval. Commands: /bye /reset /ws%s" % (DIM, R))
+    print()
+
+    messages = [{"role": "system", "content": SYSTEM}]
+    pending = INIT or None
+
+    while True:
+        if pending is None:
+            try:
+                user = input("%syou>%s " % (B + CYN, R)).strip()
+            except EOFError:
+                print(); break
+            if not user:
+                continue
+            if user in ("/bye", "/exit", "/quit"):
+                break
+            if user == "/reset":
+                messages = messages[:1]; print("(history cleared)"); continue
+            if user == "/ws":
+                print(WORKSPACE); continue
+            messages.append({"role": "user", "content": user})
+        else:
+            messages.append({"role": "user", "content": pending}); pending = None
+
+        for _ in range(10):
+            try:
+                reply = chat(messages)
+            except urllib.error.URLError as e:
+                print(RED + "Cannot reach Ollama at %s: %s" % (BASE, e) + R); reply = None; break
+            except Exception as e:
+                print(RED + "Chat error: %s" % e + R); reply = None; break
+            messages.append({"role": "assistant", "content": reply})
+            print("\n%sassistant>%s %s" % (B + MAG, R, reply.strip()))
+            actions = parse_actions(reply)
+            if not actions:
+                break
+            results = []
+            for kind, arg, body in actions:
+                if not consent(kind, arg, body):
+                    results.append("[fabmyth] %s: user declined" % kind)
+                    print(YEL + "(declined)" + R)
+                    continue
+                if kind == "shell":
+                    rc, out = run_shell(body)
+                elif kind == "python":
+                    rc, out = run_code("python", body)
+                elif kind == "js":
+                    rc, out = run_code("js", body)
+                elif kind == "save":
+                    ok, info = save_file(arg, body)
+                    results.append("[fabmyth] save %s: %s" %
+                                   (arg, "saved -> " + info if ok else "FAILED: " + info))
+                    print((GRN + "saved " + info) if ok else (RED + "save failed: " + info), R)
+                    continue
+                results.append("[fabmyth] %s result (exit %d):\n%s" % (kind, rc, out or "(no output)"))
+                print(("%s%s exit %d%s" % (GRN if rc == 0 else RED, kind, rc, R)))
+                if out:
+                    print(DIM + out + R)
+            messages.append({"role": "user", "content": "\n\n".join(results)})
+        else:
+            print(YEL + "(reached the action limit for this task — tell me to continue if needed)" + R)
+
+    print("Goodbye. Files are in: %s" % WORKSPACE)
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nInterrupted.")
+PYEOF
+
+  info "Launching Termux AgenticOS with $model"
+  FABMYTH_PY="$PYBIN" OLLAMA_HOST="$OLLAMA_HOST" "$PYBIN" "$agent_py" "$model" "$@"
+}
+
+# ---------------------------------------------------------------------------
+# Web API — expose a model over HTTP + a one-tag embeddable chat widget.
+# Chat/generate only (never runs commands, unlike AgenticOS). No API key.
+# ---------------------------------------------------------------------------
+cmd_web() {
+  local model="" port="8777" host="0.0.0.0" url="" system=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --port)      port="${2:?--port needs a value}"; shift 2 ;;
+      --host)      host="${2:?--host needs a value}"; shift 2 ;;
+      --url)       url="${2:?--url needs a value}"; shift 2 ;;
+      --system)    system="${2:?--system needs a value}"; shift 2 ;;
+      --port=*)    port="${1#*=}"; shift ;;
+      --host=*)    host="${1#*=}"; shift ;;
+      --url=*)     url="${1#*=}"; shift ;;
+      --system=*)  system="${1#*=}"; shift ;;
+      -*)          die "Unknown option: $1" ;;
+      *)           if [ -z "$model" ]; then model="$1"; else die "Unexpected argument: $1"; fi; shift ;;
+    esac
+  done
+  [ -n "$model" ] || die "Usage: fabmyth web <model> [--port N] [--host H] [--url URL] [--system TEXT]"
+
+  local PYBIN
+  if have python3; then PYBIN=python3
+  elif have python; then PYBIN=python
+  else die "The web API needs Python. Install it:  pkg install python  |  apt install python3"
+  fi
+
+  ensure_server
+
+  if ! ollama list 2>/dev/null | awk 'NR>1{print $1}' | grep -qx "$model"; then
+    warn "'$model' isn't installed. Pulling it first…"
+    ollama pull "$model" || die "Could not pull $model"
+  fi
+
+  local web_py="$FABMYTH_HOME/webapi.py"
+  cat > "$web_py" <<'PYEOF'
+#!/usr/bin/env python3
+"""FaB-Myth Web API: expose ONE Ollama model over HTTP with an embeddable chat
+widget. Paste a single <script> tag into any website -- no API key.
+
+This endpoint is chat/generate only; it never executes commands (unlike the
+AgenticOS feature).
+"""
+import os, sys, json, socket
+import urllib.request, urllib.error
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+MODEL  = os.environ.get("FABMYTH_WEB_MODEL", "llama3.2:3b")
+PORT   = int(os.environ.get("FABMYTH_WEB_PORT", "8777"))
+HOST   = os.environ.get("FABMYTH_WEB_HOST", "0.0.0.0")
+SYSTEM = os.environ.get("FABMYTH_WEB_SYSTEM", "").strip()
+OHOST  = os.environ.get("OLLAMA_HOST", "127.0.0.1:11434")
+OBASE  = OHOST if OHOST.startswith("http") else "http://" + OHOST
+
+def guess_ip():
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80)); ip = s.getsockname()[0]; s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
+
+PUBLIC_URL = os.environ.get("FABMYTH_WEB_URL", "").rstrip("/")
+if not PUBLIC_URL:
+    ip = guess_ip() if HOST in ("0.0.0.0", "::", "") else HOST
+    PUBLIC_URL = "http://%s:%d" % (ip, PORT)
+
+EMBED_TAG = '<script src="%s/embed.js" data-fabmyth-model="%s"></script>' % (PUBLIC_URL, MODEL)
+EMBED_TAG_ESC = EMBED_TAG.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+EMBED_JS = r'''(function(){
+  var cs=document.currentScript;
+  if(!cs){var ss=document.getElementsByTagName('script');cs=ss[ss.length-1];}
+  var base=cs.src.replace(/\/embed\.js.*$/,'');
+  var model=cs.getAttribute('data-fabmyth-model')||'';
+  var title=cs.getAttribute('data-fabmyth-title')||'Ask AI';
+  var accent=cs.getAttribute('data-fabmyth-color')||'#4f46e5';
+  var history=[];
+  var css=[
+   '.fabmyth-btn{position:fixed;right:20px;bottom:20px;z-index:2147483000;width:56px;height:56px;border-radius:50%;border:none;cursor:pointer;box-shadow:0 6px 20px rgba(0,0,0,.25);font-size:24px;color:#fff;background:'+accent+'}',
+   '.fabmyth-panel{position:fixed;right:20px;bottom:88px;z-index:2147483000;width:min(360px,92vw);height:min(520px,72vh);background:#fff;color:#111;border-radius:14px;box-shadow:0 12px 40px rgba(0,0,0,.3);display:none;flex-direction:column;overflow:hidden;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif}',
+   '.fabmyth-panel.open{display:flex}',
+   '.fabmyth-head{background:'+accent+';color:#fff;padding:12px 14px;font-weight:600;display:flex;justify-content:space-between;align-items:center}',
+   '.fabmyth-x{cursor:pointer;background:none;border:none;color:#fff;font-size:20px;line-height:1}',
+   '.fabmyth-msgs{flex:1;overflow-y:auto;padding:12px;display:flex;flex-direction:column;gap:8px;background:#f7f7f8}',
+   '.fabmyth-m{max-width:82%;padding:8px 11px;border-radius:12px;line-height:1.4;white-space:pre-wrap;word-wrap:break-word;font-size:14px}',
+   '.fabmyth-u{align-self:flex-end;background:'+accent+';color:#fff;border-bottom-right-radius:4px}',
+   '.fabmyth-a{align-self:flex-start;background:#fff;color:#111;border:1px solid #e5e7eb;border-bottom-left-radius:4px}',
+   '.fabmyth-foot{display:flex;gap:6px;padding:10px;border-top:1px solid #eee;background:#fff}',
+   '.fabmyth-in{flex:1;border:1px solid #d1d5db;border-radius:10px;padding:9px 11px;font-size:14px;outline:none}',
+   '.fabmyth-send{border:none;background:'+accent+';color:#fff;border-radius:10px;padding:0 14px;cursor:pointer;font-size:14px}',
+   '.fabmyth-cred{font-size:11px;color:#9ca3af;text-align:center;padding:4px}',
+   '@media (prefers-color-scheme:dark){.fabmyth-panel{background:#1f2023;color:#eee}.fabmyth-msgs{background:#17181a}.fabmyth-a{background:#26272b;color:#eee;border-color:#3a3b40}.fabmyth-foot{background:#1f2023;border-color:#2c2d31}.fabmyth-in{background:#26272b;color:#eee;border-color:#3a3b40}}'
+  ].join('');
+  var st=document.createElement('style');st.textContent=css;document.head.appendChild(st);
+  var btn=document.createElement('button');btn.className='fabmyth-btn';btn.innerHTML='&#128172;';btn.title=title;
+  var panel=document.createElement('div');panel.className='fabmyth-panel';
+  panel.innerHTML='<div class="fabmyth-head"><span></span><button class="fabmyth-x" aria-label="close">&times;</button></div>'+
+    '<div class="fabmyth-msgs"></div>'+
+    '<div class="fabmyth-foot"><input class="fabmyth-in" placeholder="Type a message..."><button class="fabmyth-send">Send</button></div>'+
+    '<div class="fabmyth-cred">powered by FaB-Myth-Ai</div>';
+  document.body.appendChild(btn);document.body.appendChild(panel);
+  panel.querySelector('.fabmyth-head span').textContent=title;
+  var msgs=panel.querySelector('.fabmyth-msgs'),input=panel.querySelector('.fabmyth-in'),sendb=panel.querySelector('.fabmyth-send');
+  function add(role,text){var d=document.createElement('div');d.className='fabmyth-m '+(role==='user'?'fabmyth-u':'fabmyth-a');d.textContent=text;msgs.appendChild(d);msgs.scrollTop=msgs.scrollHeight;return d;}
+  function toggle(open){panel.classList.toggle('open',open);if(open)input.focus();}
+  btn.onclick=function(){toggle(!panel.classList.contains('open'));};
+  panel.querySelector('.fabmyth-x').onclick=function(){toggle(false);};
+  var busy=false;
+  function send(){
+    var text=(input.value||'').trim();if(!text||busy)return;
+    input.value='';add('user',text);history.push({role:'user',content:text});
+    busy=true;sendb.disabled=true;var typing=add('assistant','...');
+    fetch(base+'/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({message:text,history:history.slice(0,-1),model:model})})
+     .then(function(r){return r.json();})
+     .then(function(j){var reply=j.reply||('[error] '+(j.error||'no response'));typing.textContent=reply;history.push({role:'assistant',content:reply});})
+     .catch(function(e){typing.textContent='[network error] '+e;})
+     .then(function(){busy=false;sendb.disabled=false;input.focus();});
+  }
+  sendb.onclick=send;
+  input.addEventListener('keydown',function(e){if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();send();}});
+})();'''
+
+DEMO_TMPL = '''<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>FaB-Myth Web API - __MODEL__</title>
+<style>body{font-family:system-ui,-apple-system,sans-serif;max-width:720px;margin:40px auto;padding:0 16px;line-height:1.55;color:#111}h1{margin-bottom:2px}code,pre{background:#f3f4f6;border-radius:6px}pre{padding:14px;overflow:auto;white-space:pre-wrap;word-break:break-all}small{color:#666}button.copy{margin-top:6px;padding:8px 12px;border:1px solid #d1d5db;border-radius:8px;background:#fff;cursor:pointer}@media(prefers-color-scheme:dark){body{background:#111;color:#eee}code,pre{background:#1e1e22}button.copy{background:#26272b;color:#eee;border-color:#3a3b40}}</style>
+</head><body>
+<h1>FaB-Myth Web API</h1>
+<small>Serving model <b>__MODEL__</b> &mdash; chat only, no commands, no API key.</small>
+<h2>Add it to your website</h2>
+<p>Paste this one tag into your HTML, just before <code>&lt;/body&gt;</code>:</p>
+<pre id="tag">__TAGESC__</pre>
+<button class="copy" onclick="navigator.clipboard.writeText(document.getElementById('tag').textContent);this.textContent='Copied!'">Copy tag</button>
+<h2>Live preview</h2>
+<p>The chat bubble in the bottom-right corner of this page is the real widget, talking to your model.</p>
+<p><small>Endpoint: <code>POST __URL__/api/chat</code> &middot; health: <code>__URL__/health</code></small></p>
+__TAG__
+</body></html>'''
+DEMO_HTML = (DEMO_TMPL.replace("__MODEL__", MODEL)
+                      .replace("__URL__", PUBLIC_URL)
+                      .replace("__TAGESC__", EMBED_TAG_ESC)
+                      .replace("__TAG__", EMBED_TAG))
+
+def ollama_chat(messages):
+    data = json.dumps({"model": MODEL, "messages": messages, "stream": False}).encode()
+    req = urllib.request.Request(OBASE + "/api/chat", data=data,
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=600) as r:
+        return json.loads(r.read().decode())["message"]["content"]
+
+class Handler(BaseHTTPRequestHandler):
+    def _cors(self):
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+    def _send(self, code, body, ctype="application/json"):
+        if isinstance(body, str):
+            body = body.encode()
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self._cors()
+        self.end_headers()
+        self.wfile.write(body)
+    def do_OPTIONS(self):
+        self.send_response(204); self._cors(); self.end_headers()
+    def do_GET(self):
+        p = self.path.split("?")[0]
+        if p == "/embed.js":
+            self._send(200, EMBED_JS, "application/javascript; charset=utf-8")
+        elif p in ("/", "/index.html", "/demo"):
+            self._send(200, DEMO_HTML, "text/html; charset=utf-8")
+        elif p == "/health":
+            self._send(200, json.dumps({"ok": True, "model": MODEL}))
+        else:
+            self._send(404, json.dumps({"error": "not found"}))
+    def do_POST(self):
+        if self.path.split("?")[0] != "/api/chat":
+            self._send(404, json.dumps({"error": "not found"})); return
+        try:
+            ln = int(self.headers.get("Content-Length", 0))
+            payload = json.loads(self.rfile.read(ln).decode() or "{}")
+        except Exception:
+            self._send(400, json.dumps({"error": "invalid JSON"})); return
+        messages = []
+        if SYSTEM:
+            messages.append({"role": "system", "content": SYSTEM})
+        hist = payload.get("history") or payload.get("messages") or []
+        if isinstance(hist, list):
+            for m in hist[-20:]:
+                if isinstance(m, dict) and m.get("role") in ("user", "assistant") and m.get("content"):
+                    messages.append({"role": m["role"], "content": str(m["content"])[:8000]})
+        msg = payload.get("message")
+        if msg:
+            messages.append({"role": "user", "content": str(msg)[:8000]})
+        if not messages or messages[-1]["role"] != "user":
+            self._send(400, json.dumps({"error": "no user message provided"})); return
+        try:
+            reply = ollama_chat(messages)
+        except urllib.error.URLError as e:
+            self._send(502, json.dumps({"error": "ollama unreachable: %s" % e})); return
+        except Exception as e:
+            self._send(502, json.dumps({"error": str(e)})); return
+        self._send(200, json.dumps({"reply": reply, "model": MODEL}))
+    def log_message(self, *a):
+        pass
+
+def main():
+    print("FaB-Myth Web API")
+    print("  model      : %s" % MODEL)
+    print("  binding    : %s:%d" % (HOST, PORT))
+    print("  public url : %s" % PUBLIC_URL)
+    print()
+    print("Paste this ONE tag into your website (no API key needed):")
+    print()
+    print("    " + EMBED_TAG)
+    print()
+    print("Preview / copy page: %s" % PUBLIC_URL)
+    print("Chat-only API (never runs commands). Press Ctrl-C to stop.")
+    if HOST in ("0.0.0.0", "::", ""):
+        print("NOTE: bound to all interfaces -- anyone who can reach this host can use")
+        print("      the model. For a public website, front it with a tunnel/HTTPS and")
+        print("      pass --url <your-https-url>.")
+    print()
+    try:
+        ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()
+    except KeyboardInterrupt:
+        print("\nStopped.")
+    except OSError as e:
+        sys.stderr.write("Could not bind %s:%d -- %s\n" % (HOST, PORT, e)); sys.exit(1)
+
+if __name__ == "__main__":
+    main()
+PYEOF
+
+  info "Starting FaB-Myth Web API for $model"
+  FABMYTH_WEB_MODEL="$model" FABMYTH_WEB_PORT="$port" FABMYTH_WEB_HOST="$host" \
+  FABMYTH_WEB_URL="$url" FABMYTH_WEB_SYSTEM="$system" OLLAMA_HOST="$OLLAMA_HOST" \
+  "$PYBIN" "$web_py"
+}
+
 cmd_list() {
   ensure_server
   ollama list
@@ -411,6 +917,14 @@ cmd_doctor() {
   have tar  && check "tar"  ok || check "tar"  warn "needed for userspace install"
   have jq   && check "jq"   ok || check "jq"   warn "optional, nicer status output"
 
+  # AgenticOS prerequisites
+  if have python3 || have python; then
+    check "python (agent)" ok "AgenticOS ready"
+  else
+    check "python (agent)" warn "needed for 'fabmyth agent' — pkg install python"
+  fi
+  have node && check "node (agent js)" ok || check "node (agent js)" warn "optional, only for JS actions — pkg install nodejs"
+
   if have ollama; then
     check "ollama" ok "$(ollama --version 2>/dev/null | head -1)"
   else
@@ -441,6 +955,69 @@ cmd_doctor() {
   fi
 }
 
+# Self-update: fetch the latest fabmyth and replace this script in place.
+cmd_update() {
+  local ref="main"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --branch|--ref) ref="${2:?--branch needs a value}"; shift 2 ;;
+      --branch=*|--ref=*) ref="${1#*=}"; shift ;;
+      -*) die "Unknown option: $1" ;;
+      *)  ref="$1"; shift ;;
+    esac
+  done
+  have curl || die "update needs curl."
+
+  # Resolve the actual file backing the running command.
+  local src="${BASH_SOURCE[0]:-$0}" self
+  self="$(cd "$(dirname "$src")" 2>/dev/null && pwd)/$(basename "$src")"
+  if [ ! -e "$self" ]; then
+    self="$(command -v fabmyth 2>/dev/null || true)"
+  fi
+  [ -n "$self" ] && [ -e "$self" ] || die "Couldn't locate the installed fabmyth to update."
+
+  local url="$FABMYTH_REPO_RAW/$ref/bin/fabmyth"
+  info "Checking for updates (ref: $ref)"
+  say "  target: $self"
+
+  # Write the temp file in the target's directory so the final move is an
+  # atomic same-filesystem rename (the running script's inode is untouched).
+  local dir; dir="$(dirname "$self")"
+  local tmp
+  if ! tmp="$(mktemp "$dir/.fabmyth.XXXXXX" 2>/dev/null)"; then
+    err "Can't write to $dir (permission denied)."
+    say "  Try:  sudo fabmyth update"
+    say "  or reinstall: curl -fsSL $FABMYTH_REPO_RAW/$ref/install.sh | bash"
+    return 1
+  fi
+
+  if ! curl -fsSL "$url" -o "$tmp"; then
+    rm -f "$tmp"; die "Download failed: $url  (check the branch name and your network)."
+  fi
+  if ! head -1 "$tmp" | grep -q '^#!/usr/bin/env bash' || ! grep -q 'FABMYTH_VERSION=' "$tmp"; then
+    rm -f "$tmp"; die "Downloaded file doesn't look like fabmyth — aborting (nothing changed)."
+  fi
+
+  local newver
+  newver="$(grep -m1 'FABMYTH_VERSION=' "$tmp" | sed -E 's/.*"([^"]+)".*/\1/')"
+  if [ "$newver" = "$FABMYTH_VERSION" ]; then
+    rm -f "$tmp"
+    ok "Already up to date (v$FABMYTH_VERSION)."
+    return 0
+  fi
+
+  cp -f "$self" "$FABMYTH_HOME/fabmyth.bak" 2>/dev/null || true
+  chmod 0755 "$tmp"
+  if mv -f "$tmp" "$self"; then
+    ok "Updated fabmyth: v$FABMYTH_VERSION -> v$newver"
+    say "  backup of the previous version: $FABMYTH_HOME/fabmyth.bak"
+  else
+    rm -f "$tmp"
+    err "Failed to replace $self."
+    return 1
+  fi
+}
+
 cmd_version() { say "FaB-Myth-Ai (fabmyth) v$FABMYTH_VERSION"; }
 
 cmd_help() {
@@ -465,8 +1042,20 @@ ${C_BOLD}Models${C_RESET}
   ps                    Show currently running models
   rm <model>            Remove an installed model
 
+${C_BOLD}Termux AgenticOS${C_RESET}
+  agent <model> [task]  Let the model run shell / Python / JS and save files —
+                        every action needs your approval. Files go to
+                        <storage>/FabMyth/<model>/ (/sdcard on Termux).
+
+${C_BOLD}Web API (embed on a website)${C_RESET}
+  web <model> [opts]    Serve a model over HTTP + an embeddable chat widget.
+                        Prints one <script> tag to paste into your site (no
+                        key). Chat-only — never runs commands.
+                        Options: --port N  --host H  --url URL  --system TEXT
+
 ${C_BOLD}Other${C_RESET}
   logs [-f|N]           Show server logs (-f to follow, N lines)
+  update [--branch B]   Update fabmyth to the latest version (self-update)
   version               Print version
   help                  This message
 
@@ -474,8 +1063,11 @@ ${C_BOLD}Quick start${C_RESET}
   fabmyth setup && fabmyth start
   fabmyth pull llama3.2:1b
   fabmyth chat
+  fabmyth agent llama3.2:3b "make a hello.txt file"
+  fabmyth web llama3.2:3b            # get an embed tag for your website
 
 Env: OLLAMA_HOST (default $OLLAMA_HOST_DEFAULT), FABMYTH_HOME ($FABMYTH_HOME)
+     FABMYTH_STORAGE (override AgenticOS file location)
 EOF
 }
 
@@ -493,11 +1085,14 @@ main() {
     pull|download)     cmd_pull "$@" ;;
     run)               cmd_run "$@" ;;
     chat)              cmd_chat "$@" ;;
+    agent|agentic|agenticos) cmd_agent "$@" ;;
+    web|api|webapi)    cmd_web "$@" ;;
     list|ls)           cmd_list "$@" ;;
     ps)                cmd_ps "$@" ;;
     rm|remove)         cmd_rm "$@" ;;
     search|browse)     cmd_search "$@" ;;
     logs|log)          cmd_logs "$@" ;;
+    update|upgrade|self-update) cmd_update "$@" ;;
     doctor)            cmd_doctor "$@" ;;
     version|--version|-v) cmd_version ;;
     help|--help|-h)    cmd_help ;;

@@ -47,6 +47,18 @@ The installer only requires `bash` and `curl`. It places the `fabmyth` command
 on your PATH (`$PREFIX/bin` on Termux, `/usr/local/bin` or `~/.local/bin` on
 Linux).
 
+### Updating
+
+Once installed, update in place with:
+
+```bash
+fabmyth update
+```
+
+It fetches the latest `fabmyth`, keeps a backup at `~/.fabmyth/fabmyth.bak`, and
+replaces itself atomically. To pull from a specific branch (e.g. before a change
+is merged to `main`): `fabmyth update --branch <name>`.
+
 ## Quick start
 
 ```bash
@@ -75,9 +87,92 @@ On **Termux**, follow the dedicated walkthrough in
 | `fabmyth chat` | Pick an installed model and chat |
 | `fabmyth list` / `ps` | List installed / running models |
 | `fabmyth rm <model>` | Remove a model |
+| `fabmyth agent <model> [task]` | **Termux AgenticOS** — let the model act on your device (see below) |
+| `fabmyth web <model> [opts]` | **Web API** — serve a model + embeddable chat widget for your site (see below) |
+| `fabmyth update [--branch B]` | Self-update to the latest version |
 | `fabmyth logs [-f\|N]` | Show server logs |
 
 Run `fabmyth help` for the full list.
+
+## Termux AgenticOS
+
+`fabmyth agent` turns a local model into a hands-on agent that can **run shell,
+Python, and JavaScript** and **save files** on your device — with a hard rule:
+**you approve every single action before it runs.**
+
+```bash
+fabmyth agent llama3.2:3b "make a file called notes.txt with a haiku in it"
+```
+
+How it works:
+
+- The model requests actions by emitting tagged fenced blocks — `fabmyth-sh`,
+  `fabmyth-py`, `fabmyth-js`, or `fabmyth-save <file>`. **Only these tagged
+  blocks ever run**, so ordinary code examples in its replies never execute.
+- Before anything runs, fabmyth shows you the exact command or file contents and
+  asks: `[y]es / [N]o / [a]ll this session / [q]uit`. The default is **No**.
+- The action's output is fed back to the model so it can chain steps toward the
+  goal, up to a per-task action limit.
+- Files the model creates are saved under **`<storage>/FabMyth/<ModelName>/`** —
+  on Termux that's `/sdcard/FabMyth/<model>/`, so you can open them in any
+  Android app. Paths are sandboxed to that folder (no `..` escapes, no absolute
+  paths). Set `FABMYTH_STORAGE` to change the base location.
+
+Requirements: Python (`pkg install python`) for the agent loop; Node.js
+(`pkg install nodejs`) only if you want the model to run JavaScript. Run
+`fabmyth doctor` to check.
+
+In-session commands: `/bye` to quit, `/reset` to clear history, `/ws` to print
+the workspace path.
+
+> **Heads up:** this executes model-generated code on your device. The approval
+> prompt is your safety gate — read each command before you approve it, and use
+> `[a]ll` only when you trust the whole task.
+
+## Web API — put your model on a website
+
+`fabmyth web` stands up a small HTTP server for one model and gives you a single
+`<script>` tag to drop into any website — **no API key**. It's **chat-only** and
+never runs commands (that's AgenticOS's job, and it's deliberately separate).
+
+```bash
+fabmyth web llama3.2:3b
+```
+
+It prints a tag like this to paste into your HTML (just before `</body>`):
+
+```html
+<script src="http://YOUR_HOST:8777/embed.js" data-fabmyth-model="llama3.2:3b"></script>
+```
+
+That tag adds a floating chat bubble to your site, wired to your model. You can
+customize it with data attributes:
+
+```html
+<script src="http://YOUR_HOST:8777/embed.js"
+        data-fabmyth-model="llama3.2:3b"
+        data-fabmyth-title="Support Bot"
+        data-fabmyth-color="#e11d48"></script>
+```
+
+**Endpoints** (CORS-open so any site can call them):
+
+| Route | Purpose |
+|---|---|
+| `GET /` | Preview page with a live widget and the copy-paste tag |
+| `GET /embed.js` | The widget script the tag loads |
+| `POST /api/chat` | `{ "message": "...", "history": [...] }` → `{ "reply": "..." }` |
+| `GET /health` | `{ "ok": true, "model": "..." }` |
+
+**Options:** `--port N` (default 8777), `--host H` (default `0.0.0.0`),
+`--url URL` (public base URL used in the printed tag — set this when fronting the
+API with a tunnel/HTTPS), `--system TEXT` (a system prompt / persona for the bot).
+
+> **No key by design** means the endpoint is open to anyone who can reach it. For
+> local use or your own LAN that's fine. To expose it to the public internet
+> (e.g. from a phone on Termux), run it behind a tunnel — `cloudflared`,
+> `ngrok`, or an SSH tunnel — and pass that HTTPS address via `--url` so the
+> embed tag points at it.
 
 ## How it works
 
