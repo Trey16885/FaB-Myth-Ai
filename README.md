@@ -76,6 +76,7 @@ On **Termux**, follow the dedicated walkthrough in
 | `fabmyth list` / `ps` | List installed / running models |
 | `fabmyth rm <model>` | Remove a model |
 | `fabmyth agent <model> [task]` | **Termux AgenticOS** — let the model act on your device (see below) |
+| `fabmyth web <model> [opts]` | **Web API** — serve a model + embeddable chat widget for your site (see below) |
 | `fabmyth logs [-f\|N]` | Show server logs |
 
 Run `fabmyth help` for the full list.
@@ -114,6 +115,51 @@ the workspace path.
 > **Heads up:** this executes model-generated code on your device. The approval
 > prompt is your safety gate — read each command before you approve it, and use
 > `[a]ll` only when you trust the whole task.
+
+## Web API — put your model on a website
+
+`fabmyth web` stands up a small HTTP server for one model and gives you a single
+`<script>` tag to drop into any website — **no API key**. It's **chat-only** and
+never runs commands (that's AgenticOS's job, and it's deliberately separate).
+
+```bash
+fabmyth web llama3.2:3b
+```
+
+It prints a tag like this to paste into your HTML (just before `</body>`):
+
+```html
+<script src="http://YOUR_HOST:8777/embed.js" data-fabmyth-model="llama3.2:3b"></script>
+```
+
+That tag adds a floating chat bubble to your site, wired to your model. You can
+customize it with data attributes:
+
+```html
+<script src="http://YOUR_HOST:8777/embed.js"
+        data-fabmyth-model="llama3.2:3b"
+        data-fabmyth-title="Support Bot"
+        data-fabmyth-color="#e11d48"></script>
+```
+
+**Endpoints** (CORS-open so any site can call them):
+
+| Route | Purpose |
+|---|---|
+| `GET /` | Preview page with a live widget and the copy-paste tag |
+| `GET /embed.js` | The widget script the tag loads |
+| `POST /api/chat` | `{ "message": "...", "history": [...] }` → `{ "reply": "..." }` |
+| `GET /health` | `{ "ok": true, "model": "..." }` |
+
+**Options:** `--port N` (default 8777), `--host H` (default `0.0.0.0`),
+`--url URL` (public base URL used in the printed tag — set this when fronting the
+API with a tunnel/HTTPS), `--system TEXT` (a system prompt / persona for the bot).
+
+> **No key by design** means the endpoint is open to anyone who can reach it. For
+> local use or your own LAN that's fine. To expose it to the public internet
+> (e.g. from a phone on Termux), run it behind a tunnel — `cloudflared`,
+> `ngrok`, or an SSH tunnel — and pass that HTTPS address via `--url` so the
+> embed tag points at it.
 
 ## How it works
 

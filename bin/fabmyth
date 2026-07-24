@@ -19,7 +19,7 @@
 # MIT License — Copyright (c) 2026 Trey16885
 set -euo pipefail
 
-FABMYTH_VERSION="0.2.0"
+FABMYTH_VERSION="0.3.0"
 
 # ---------------------------------------------------------------------------
 # Colors (disabled when not a TTY or NO_COLOR is set)
@@ -587,6 +587,250 @@ PYEOF
   FABMYTH_PY="$PYBIN" OLLAMA_HOST="$OLLAMA_HOST" "$PYBIN" "$agent_py" "$model" "$@"
 }
 
+# ---------------------------------------------------------------------------
+# Web API — expose a model over HTTP + a one-tag embeddable chat widget.
+# Chat/generate only (never runs commands, unlike AgenticOS). No API key.
+# ---------------------------------------------------------------------------
+cmd_web() {
+  local model="" port="8777" host="0.0.0.0" url="" system=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --port)      port="${2:?--port needs a value}"; shift 2 ;;
+      --host)      host="${2:?--host needs a value}"; shift 2 ;;
+      --url)       url="${2:?--url needs a value}"; shift 2 ;;
+      --system)    system="${2:?--system needs a value}"; shift 2 ;;
+      --port=*)    port="${1#*=}"; shift ;;
+      --host=*)    host="${1#*=}"; shift ;;
+      --url=*)     url="${1#*=}"; shift ;;
+      --system=*)  system="${1#*=}"; shift ;;
+      -*)          die "Unknown option: $1" ;;
+      *)           if [ -z "$model" ]; then model="$1"; else die "Unexpected argument: $1"; fi; shift ;;
+    esac
+  done
+  [ -n "$model" ] || die "Usage: fabmyth web <model> [--port N] [--host H] [--url URL] [--system TEXT]"
+
+  local PYBIN
+  if have python3; then PYBIN=python3
+  elif have python; then PYBIN=python
+  else die "The web API needs Python. Install it:  pkg install python  |  apt install python3"
+  fi
+
+  ensure_server
+
+  if ! ollama list 2>/dev/null | awk 'NR>1{print $1}' | grep -qx "$model"; then
+    warn "'$model' isn't installed. Pulling it first…"
+    ollama pull "$model" || die "Could not pull $model"
+  fi
+
+  local web_py="$FABMYTH_HOME/webapi.py"
+  cat > "$web_py" <<'PYEOF'
+#!/usr/bin/env python3
+"""FaB-Myth Web API: expose ONE Ollama model over HTTP with an embeddable chat
+widget. Paste a single <script> tag into any website -- no API key.
+
+This endpoint is chat/generate only; it never executes commands (unlike the
+AgenticOS feature).
+"""
+import os, sys, json, socket
+import urllib.request, urllib.error
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+MODEL  = os.environ.get("FABMYTH_WEB_MODEL", "llama3.2:3b")
+PORT   = int(os.environ.get("FABMYTH_WEB_PORT", "8777"))
+HOST   = os.environ.get("FABMYTH_WEB_HOST", "0.0.0.0")
+SYSTEM = os.environ.get("FABMYTH_WEB_SYSTEM", "").strip()
+OHOST  = os.environ.get("OLLAMA_HOST", "127.0.0.1:11434")
+OBASE  = OHOST if OHOST.startswith("http") else "http://" + OHOST
+
+def guess_ip():
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80)); ip = s.getsockname()[0]; s.close()
+        return ip
+    except Exception:
+        return "127.0.0.1"
+
+PUBLIC_URL = os.environ.get("FABMYTH_WEB_URL", "").rstrip("/")
+if not PUBLIC_URL:
+    ip = guess_ip() if HOST in ("0.0.0.0", "::", "") else HOST
+    PUBLIC_URL = "http://%s:%d" % (ip, PORT)
+
+EMBED_TAG = '<script src="%s/embed.js" data-fabmyth-model="%s"></script>' % (PUBLIC_URL, MODEL)
+EMBED_TAG_ESC = EMBED_TAG.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+EMBED_JS = r'''(function(){
+  var cs=document.currentScript;
+  if(!cs){var ss=document.getElementsByTagName('script');cs=ss[ss.length-1];}
+  var base=cs.src.replace(/\/embed\.js.*$/,'');
+  var model=cs.getAttribute('data-fabmyth-model')||'';
+  var title=cs.getAttribute('data-fabmyth-title')||'Ask AI';
+  var accent=cs.getAttribute('data-fabmyth-color')||'#4f46e5';
+  var history=[];
+  var css=[
+   '.fabmyth-btn{position:fixed;right:20px;bottom:20px;z-index:2147483000;width:56px;height:56px;border-radius:50%;border:none;cursor:pointer;box-shadow:0 6px 20px rgba(0,0,0,.25);font-size:24px;color:#fff;background:'+accent+'}',
+   '.fabmyth-panel{position:fixed;right:20px;bottom:88px;z-index:2147483000;width:min(360px,92vw);height:min(520px,72vh);background:#fff;color:#111;border-radius:14px;box-shadow:0 12px 40px rgba(0,0,0,.3);display:none;flex-direction:column;overflow:hidden;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif}',
+   '.fabmyth-panel.open{display:flex}',
+   '.fabmyth-head{background:'+accent+';color:#fff;padding:12px 14px;font-weight:600;display:flex;justify-content:space-between;align-items:center}',
+   '.fabmyth-x{cursor:pointer;background:none;border:none;color:#fff;font-size:20px;line-height:1}',
+   '.fabmyth-msgs{flex:1;overflow-y:auto;padding:12px;display:flex;flex-direction:column;gap:8px;background:#f7f7f8}',
+   '.fabmyth-m{max-width:82%;padding:8px 11px;border-radius:12px;line-height:1.4;white-space:pre-wrap;word-wrap:break-word;font-size:14px}',
+   '.fabmyth-u{align-self:flex-end;background:'+accent+';color:#fff;border-bottom-right-radius:4px}',
+   '.fabmyth-a{align-self:flex-start;background:#fff;color:#111;border:1px solid #e5e7eb;border-bottom-left-radius:4px}',
+   '.fabmyth-foot{display:flex;gap:6px;padding:10px;border-top:1px solid #eee;background:#fff}',
+   '.fabmyth-in{flex:1;border:1px solid #d1d5db;border-radius:10px;padding:9px 11px;font-size:14px;outline:none}',
+   '.fabmyth-send{border:none;background:'+accent+';color:#fff;border-radius:10px;padding:0 14px;cursor:pointer;font-size:14px}',
+   '.fabmyth-cred{font-size:11px;color:#9ca3af;text-align:center;padding:4px}',
+   '@media (prefers-color-scheme:dark){.fabmyth-panel{background:#1f2023;color:#eee}.fabmyth-msgs{background:#17181a}.fabmyth-a{background:#26272b;color:#eee;border-color:#3a3b40}.fabmyth-foot{background:#1f2023;border-color:#2c2d31}.fabmyth-in{background:#26272b;color:#eee;border-color:#3a3b40}}'
+  ].join('');
+  var st=document.createElement('style');st.textContent=css;document.head.appendChild(st);
+  var btn=document.createElement('button');btn.className='fabmyth-btn';btn.innerHTML='&#128172;';btn.title=title;
+  var panel=document.createElement('div');panel.className='fabmyth-panel';
+  panel.innerHTML='<div class="fabmyth-head"><span></span><button class="fabmyth-x" aria-label="close">&times;</button></div>'+
+    '<div class="fabmyth-msgs"></div>'+
+    '<div class="fabmyth-foot"><input class="fabmyth-in" placeholder="Type a message..."><button class="fabmyth-send">Send</button></div>'+
+    '<div class="fabmyth-cred">powered by FaB-Myth-Ai</div>';
+  document.body.appendChild(btn);document.body.appendChild(panel);
+  panel.querySelector('.fabmyth-head span').textContent=title;
+  var msgs=panel.querySelector('.fabmyth-msgs'),input=panel.querySelector('.fabmyth-in'),sendb=panel.querySelector('.fabmyth-send');
+  function add(role,text){var d=document.createElement('div');d.className='fabmyth-m '+(role==='user'?'fabmyth-u':'fabmyth-a');d.textContent=text;msgs.appendChild(d);msgs.scrollTop=msgs.scrollHeight;return d;}
+  function toggle(open){panel.classList.toggle('open',open);if(open)input.focus();}
+  btn.onclick=function(){toggle(!panel.classList.contains('open'));};
+  panel.querySelector('.fabmyth-x').onclick=function(){toggle(false);};
+  var busy=false;
+  function send(){
+    var text=(input.value||'').trim();if(!text||busy)return;
+    input.value='';add('user',text);history.push({role:'user',content:text});
+    busy=true;sendb.disabled=true;var typing=add('assistant','...');
+    fetch(base+'/api/chat',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({message:text,history:history.slice(0,-1),model:model})})
+     .then(function(r){return r.json();})
+     .then(function(j){var reply=j.reply||('[error] '+(j.error||'no response'));typing.textContent=reply;history.push({role:'assistant',content:reply});})
+     .catch(function(e){typing.textContent='[network error] '+e;})
+     .then(function(){busy=false;sendb.disabled=false;input.focus();});
+  }
+  sendb.onclick=send;
+  input.addEventListener('keydown',function(e){if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();send();}});
+})();'''
+
+DEMO_TMPL = '''<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>FaB-Myth Web API - __MODEL__</title>
+<style>body{font-family:system-ui,-apple-system,sans-serif;max-width:720px;margin:40px auto;padding:0 16px;line-height:1.55;color:#111}h1{margin-bottom:2px}code,pre{background:#f3f4f6;border-radius:6px}pre{padding:14px;overflow:auto;white-space:pre-wrap;word-break:break-all}small{color:#666}button.copy{margin-top:6px;padding:8px 12px;border:1px solid #d1d5db;border-radius:8px;background:#fff;cursor:pointer}@media(prefers-color-scheme:dark){body{background:#111;color:#eee}code,pre{background:#1e1e22}button.copy{background:#26272b;color:#eee;border-color:#3a3b40}}</style>
+</head><body>
+<h1>FaB-Myth Web API</h1>
+<small>Serving model <b>__MODEL__</b> &mdash; chat only, no commands, no API key.</small>
+<h2>Add it to your website</h2>
+<p>Paste this one tag into your HTML, just before <code>&lt;/body&gt;</code>:</p>
+<pre id="tag">__TAGESC__</pre>
+<button class="copy" onclick="navigator.clipboard.writeText(document.getElementById('tag').textContent);this.textContent='Copied!'">Copy tag</button>
+<h2>Live preview</h2>
+<p>The chat bubble in the bottom-right corner of this page is the real widget, talking to your model.</p>
+<p><small>Endpoint: <code>POST __URL__/api/chat</code> &middot; health: <code>__URL__/health</code></small></p>
+__TAG__
+</body></html>'''
+DEMO_HTML = (DEMO_TMPL.replace("__MODEL__", MODEL)
+                      .replace("__URL__", PUBLIC_URL)
+                      .replace("__TAGESC__", EMBED_TAG_ESC)
+                      .replace("__TAG__", EMBED_TAG))
+
+def ollama_chat(messages):
+    data = json.dumps({"model": MODEL, "messages": messages, "stream": False}).encode()
+    req = urllib.request.Request(OBASE + "/api/chat", data=data,
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=600) as r:
+        return json.loads(r.read().decode())["message"]["content"]
+
+class Handler(BaseHTTPRequestHandler):
+    def _cors(self):
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+    def _send(self, code, body, ctype="application/json"):
+        if isinstance(body, str):
+            body = body.encode()
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self._cors()
+        self.end_headers()
+        self.wfile.write(body)
+    def do_OPTIONS(self):
+        self.send_response(204); self._cors(); self.end_headers()
+    def do_GET(self):
+        p = self.path.split("?")[0]
+        if p == "/embed.js":
+            self._send(200, EMBED_JS, "application/javascript; charset=utf-8")
+        elif p in ("/", "/index.html", "/demo"):
+            self._send(200, DEMO_HTML, "text/html; charset=utf-8")
+        elif p == "/health":
+            self._send(200, json.dumps({"ok": True, "model": MODEL}))
+        else:
+            self._send(404, json.dumps({"error": "not found"}))
+    def do_POST(self):
+        if self.path.split("?")[0] != "/api/chat":
+            self._send(404, json.dumps({"error": "not found"})); return
+        try:
+            ln = int(self.headers.get("Content-Length", 0))
+            payload = json.loads(self.rfile.read(ln).decode() or "{}")
+        except Exception:
+            self._send(400, json.dumps({"error": "invalid JSON"})); return
+        messages = []
+        if SYSTEM:
+            messages.append({"role": "system", "content": SYSTEM})
+        hist = payload.get("history") or payload.get("messages") or []
+        if isinstance(hist, list):
+            for m in hist[-20:]:
+                if isinstance(m, dict) and m.get("role") in ("user", "assistant") and m.get("content"):
+                    messages.append({"role": m["role"], "content": str(m["content"])[:8000]})
+        msg = payload.get("message")
+        if msg:
+            messages.append({"role": "user", "content": str(msg)[:8000]})
+        if not messages or messages[-1]["role"] != "user":
+            self._send(400, json.dumps({"error": "no user message provided"})); return
+        try:
+            reply = ollama_chat(messages)
+        except urllib.error.URLError as e:
+            self._send(502, json.dumps({"error": "ollama unreachable: %s" % e})); return
+        except Exception as e:
+            self._send(502, json.dumps({"error": str(e)})); return
+        self._send(200, json.dumps({"reply": reply, "model": MODEL}))
+    def log_message(self, *a):
+        pass
+
+def main():
+    print("FaB-Myth Web API")
+    print("  model      : %s" % MODEL)
+    print("  binding    : %s:%d" % (HOST, PORT))
+    print("  public url : %s" % PUBLIC_URL)
+    print()
+    print("Paste this ONE tag into your website (no API key needed):")
+    print()
+    print("    " + EMBED_TAG)
+    print()
+    print("Preview / copy page: %s" % PUBLIC_URL)
+    print("Chat-only API (never runs commands). Press Ctrl-C to stop.")
+    if HOST in ("0.0.0.0", "::", ""):
+        print("NOTE: bound to all interfaces -- anyone who can reach this host can use")
+        print("      the model. For a public website, front it with a tunnel/HTTPS and")
+        print("      pass --url <your-https-url>.")
+    print()
+    try:
+        ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()
+    except KeyboardInterrupt:
+        print("\nStopped.")
+    except OSError as e:
+        sys.stderr.write("Could not bind %s:%d -- %s\n" % (HOST, PORT, e)); sys.exit(1)
+
+if __name__ == "__main__":
+    main()
+PYEOF
+
+  info "Starting FaB-Myth Web API for $model"
+  FABMYTH_WEB_MODEL="$model" FABMYTH_WEB_PORT="$port" FABMYTH_WEB_HOST="$host" \
+  FABMYTH_WEB_URL="$url" FABMYTH_WEB_SYSTEM="$system" OLLAMA_HOST="$OLLAMA_HOST" \
+  "$PYBIN" "$web_py"
+}
+
 cmd_list() {
   ensure_server
   ollama list
@@ -737,6 +981,12 @@ ${C_BOLD}Termux AgenticOS${C_RESET}
                         every action needs your approval. Files go to
                         <storage>/FabMyth/<model>/ (/sdcard on Termux).
 
+${C_BOLD}Web API (embed on a website)${C_RESET}
+  web <model> [opts]    Serve a model over HTTP + an embeddable chat widget.
+                        Prints one <script> tag to paste into your site (no
+                        key). Chat-only — never runs commands.
+                        Options: --port N  --host H  --url URL  --system TEXT
+
 ${C_BOLD}Other${C_RESET}
   logs [-f|N]           Show server logs (-f to follow, N lines)
   version               Print version
@@ -747,6 +997,7 @@ ${C_BOLD}Quick start${C_RESET}
   fabmyth pull llama3.2:1b
   fabmyth chat
   fabmyth agent llama3.2:3b "make a hello.txt file"
+  fabmyth web llama3.2:3b            # get an embed tag for your website
 
 Env: OLLAMA_HOST (default $OLLAMA_HOST_DEFAULT), FABMYTH_HOME ($FABMYTH_HOME)
      FABMYTH_STORAGE (override AgenticOS file location)
@@ -768,6 +1019,7 @@ main() {
     run)               cmd_run "$@" ;;
     chat)              cmd_chat "$@" ;;
     agent|agentic|agenticos) cmd_agent "$@" ;;
+    web|api|webapi)    cmd_web "$@" ;;
     list|ls)           cmd_list "$@" ;;
     ps)                cmd_ps "$@" ;;
     rm|remove)         cmd_rm "$@" ;;

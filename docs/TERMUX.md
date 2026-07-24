@@ -117,6 +117,32 @@ Small models (1–3B) are hit-or-miss at following the action format — if the
 agent isn't emitting `fabmyth-` blocks, a 3B+ model (e.g. `llama3.2:3b`,
 `qwen2.5:3b`) tends to behave better.
 
+## Web API — embed your model on a website
+
+`fabmyth web` gives you a `<script>` tag (no key) that adds a chat widget backed
+by your model to any site:
+
+```bash
+pkg install -y python
+fabmyth web llama3.2:3b
+```
+
+Open the printed preview URL to see the widget and copy the tag. This is
+**chat-only** — it never runs commands.
+
+To reach it from a real website (a phone isn't publicly addressable on its own),
+run it behind a tunnel and point the tag at that URL:
+
+```bash
+pkg install -y cloudflared        # or use ngrok / an SSH tunnel
+cloudflared tunnel --url http://localhost:8777    # gives you an https URL
+# then, in another Termux session:
+fabmyth web llama3.2:3b --url https://your-tunnel-url.trycloudflare.com
+```
+
+The `--url` value is what gets baked into the embed tag, so visitors' browsers
+hit the tunnel instead of your phone's local address.
+
 ## Keeping it running
 
 - **Prevent Android from killing Termux:** acquire a wakelock with
