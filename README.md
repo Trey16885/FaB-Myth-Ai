@@ -87,12 +87,47 @@ On **Termux**, follow the dedicated walkthrough in
 | `fabmyth chat` | Pick an installed model and chat |
 | `fabmyth list` / `ps` | List installed / running models |
 | `fabmyth rm <model>` | Remove a model |
+| `fabmyth remember <model> [msg]` | Chat with **persistent per-model memory** (see below) |
+| `fabmyth memory <list\|show\|clear>` | Manage saved memories |
 | `fabmyth agent <model> [task]` | **Termux AgenticOS** — let the model act on your device (see below) |
 | `fabmyth web <model> [opts]` | **Web API** — serve a model + embeddable chat widget for your site (see below) |
 | `fabmyth update [--branch B]` | Self-update to the latest version |
 | `fabmyth logs [-f\|N]` | Show server logs |
 
 Run `fabmyth help` for the full list.
+
+## Memory — models that remember you
+
+Plain `chat` forgets everything when you close it. `fabmyth remember` is a chat
+that **saves the conversation and reloads it next time**, so the model recalls
+what you told it in past sessions.
+
+```bash
+fabmyth remember llama3.2:3b
+# ... you: "my name is Trey and I like sci-fi"
+# ... quit, come back tomorrow ...
+fabmyth remember llama3.2:3b
+# ... you: "recommend me a book"  -> it already knows you like sci-fi
+```
+
+**Each model has its own separate memory.** What you tell `llama3.2:3b` is not
+visible to `qwen2.5:3b` — every model gets its own history file under
+`~/.fabmyth/memory/<model>.json` (the tag is part of the key, so `:1b` and `:3b`
+are distinct too).
+
+Manage it:
+
+```bash
+fabmyth memory list                 # which models have memory, size, last used
+fabmyth memory show llama3.2:3b     # print the stored conversation
+fabmyth memory clear llama3.2:3b    # wipe one model's memory
+fabmyth memory clear --all          # wipe every model's memory
+```
+
+Inside a `remember` session: `/forget` wipes that model's memory on the spot,
+`/memory` shows stats, `/bye` saves and exits. The most recent messages (default
+40) are sent back as context each turn — tune with `FABMYTH_MEMORY_WINDOW`, and
+set a persona with `FABMYTH_MEMORY_SYSTEM`.
 
 ## Termux AgenticOS
 
