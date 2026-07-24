@@ -19,7 +19,7 @@
 # MIT License — Copyright (c) 2026 Trey16885
 set -euo pipefail
 
-FABMYTH_VERSION="0.4.0"
+FABMYTH_VERSION="0.5.0"
 
 # ---------------------------------------------------------------------------
 # Colors (disabled when not a TTY or NO_COLOR is set)
@@ -834,6 +834,222 @@ PYEOF
   "$PYBIN" "$web_py"
 }
 
+# ---------------------------------------------------------------------------
+# Memory — persistent, per-model conversation history.
+# `remember` is a chat that recalls past sessions; `memory` manages the store.
+# Each model has its OWN memory file, keyed by model name (tag included).
+# ---------------------------------------------------------------------------
+_write_memory_py() {
+  local mem_py="$FABMYTH_HOME/memory.py"
+  cat > "$mem_py" <<'PYEOF'
+#!/usr/bin/env python3
+"""FaB-Myth memory: persistent per-model conversation history.
+
+Modes (argv[1]):
+  chat  <model> [initial message]   interactive chat that remembers past runs
+  list                              list models that have saved memory
+  show  <model>                     print a model's stored conversation
+  clear <model> | clear --all       erase memory for one model / all models
+
+Each model's history lives in its OWN file, so models never share memory.
+"""
+import os, sys, re, json, time
+import urllib.request, urllib.error
+
+HOST  = os.environ.get("OLLAMA_HOST", "127.0.0.1:11434")
+BASE  = HOST if HOST.startswith("http") else "http://" + HOST
+PYBIN = os.environ.get("FABMYTH_PY", "python3")
+HOME  = os.environ.get("FABMYTH_HOME", os.path.expanduser("~/.fabmyth"))
+MEM_DIR = os.environ.get("FABMYTH_MEMORY_DIR", os.path.join(HOME, "memory"))
+os.makedirs(MEM_DIR, exist_ok=True)
+
+TTY = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+def _c(x): return x if TTY else ""
+R=_c("\033[0m"); B=_c("\033[1m"); DIM=_c("\033[2m")
+GRN=_c("\033[32m"); YEL=_c("\033[33m"); CYN=_c("\033[36m"); MAG=_c("\033[35m"); RED=_c("\033[31m")
+
+WINDOW = int(os.environ.get("FABMYTH_MEMORY_WINDOW", "40"))   # msgs sent as context
+SYSTEM = os.environ.get("FABMYTH_MEMORY_SYSTEM",
+    "You are a helpful assistant with long-term memory of this ongoing "
+    "conversation. Use what the user told you earlier when it is relevant.")
+
+def safe(m): return re.sub(r"[^A-Za-z0-9._-]", "_", m)
+def mem_file(model): return os.path.join(MEM_DIR, safe(model) + ".json")
+
+def load(model):
+    try:
+        with open(mem_file(model)) as f:
+            return json.load(f).get("messages", [])
+    except Exception:
+        return []
+
+def save(model, messages):
+    path = mem_file(model)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump({"model": model, "updated": time.time(), "messages": messages}, f)
+    os.replace(tmp, path)
+
+def api_chat(messages):
+    payload = [{"role": m["role"], "content": m["content"]} for m in messages]
+    data = json.dumps({"model": MODEL, "messages": payload, "stream": False}).encode()
+    req = urllib.request.Request(BASE + "/api/chat", data=data,
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=600) as r:
+        return json.loads(r.read().decode())["message"]["content"]
+
+def do_chat():
+    history = load(MODEL)
+    turns = sum(1 for m in history if m["role"] == "user")
+    print("%sFaB-Myth Memory Chat%s  model=%s" % (B + MAG, R, MODEL))
+    print("  memory file : %s" % mem_file(MODEL))
+    if history:
+        print("  %sremembering %d earlier message(s) across past sessions%s" % (DIM, len(history), R))
+        last_a = next((m["content"] for m in reversed(history) if m["role"] == "assistant"), "")
+        if last_a:
+            snippet = last_a.strip().replace("\n", " ")
+            print("  %slast time I said: %s%s" % (DIM, (snippet[:70] + "...") if len(snippet) > 70 else snippet, R))
+    else:
+        print("  %sno memory yet — starting fresh%s" % (DIM, R))
+    print("  %scommands: /bye  /forget (wipe this model's memory)  /memory (stats)%s" % (DIM, R))
+    print()
+
+    pending = INIT or None
+    while True:
+        if pending is None:
+            try:
+                user = input("%syou>%s " % (B + CYN, R)).strip()
+            except EOFError:
+                print(); break
+            if not user:
+                continue
+            if user in ("/bye", "/exit", "/quit"):
+                break
+            if user == "/forget":
+                try: os.remove(mem_file(MODEL))
+                except OSError: pass
+                history = []
+                print(YEL + "(memory for %s wiped)" % MODEL + R); continue
+            if user == "/memory":
+                t = sum(1 for m in history if m["role"] == "user")
+                print("%s%d messages stored (%d of your turns) in %s%s" % (DIM, len(history), t, mem_file(MODEL), R)); continue
+            msg = user
+        else:
+            msg = pending; pending = None
+
+        history.append({"role": "user", "content": msg, "ts": time.time()})
+        context = [{"role": "system", "content": SYSTEM}] + history[-WINDOW:]
+        try:
+            reply = api_chat(context)
+        except urllib.error.URLError as e:
+            print(RED + "Cannot reach Ollama at %s: %s" % (BASE, e) + R)
+            history.pop()  # don't persist a turn we couldn't answer
+            break
+        except Exception as e:
+            print(RED + "Chat error: %s" % e + R); history.pop(); break
+        history.append({"role": "assistant", "content": reply, "ts": time.time()})
+        save(MODEL, history)
+        print("\n%sassistant>%s %s\n" % (B + MAG, R, reply.strip()))
+
+    print("Memory saved to %s" % mem_file(MODEL))
+
+def do_list():
+    files = sorted(f for f in os.listdir(MEM_DIR) if f.endswith(".json"))
+    if not files:
+        print("No saved memories yet. Start one with:  fabmyth remember <model>")
+        return
+    print("%sSaved model memories%s  (%s)" % (B, R, MEM_DIR))
+    for f in files:
+        path = os.path.join(MEM_DIR, f)
+        try:
+            with open(path) as fh: d = json.load(fh)
+            msgs = d.get("messages", [])
+            model = d.get("model", f[:-5])
+            turns = sum(1 for m in msgs if m.get("role") == "user")
+            when = time.strftime("%Y-%m-%d %H:%M", time.localtime(d.get("updated", 0)))
+            kb = os.path.getsize(path) / 1024.0
+            print("  %s%-32s%s %3d turns  %6.1f KB  last %s" % (B, model, R, turns, kb, when))
+        except Exception:
+            print("  %s (unreadable)" % f)
+
+def do_show():
+    msgs = load(MODEL)
+    if not msgs:
+        print("No memory stored for %s." % MODEL); return
+    print("%sConversation memory for %s%s" % (B, MODEL, R))
+    for m in msgs:
+        who = "you" if m.get("role") == "user" else "ai "
+        col = CYN if m.get("role") == "user" else MAG
+        print("%s%s>%s %s" % (col, who, R, str(m.get("content", "")).strip()))
+
+def do_clear():
+    if MODEL == "--all":
+        n = 0
+        for f in os.listdir(MEM_DIR):
+            if f.endswith(".json"):
+                try: os.remove(os.path.join(MEM_DIR, f)); n += 1
+                except OSError: pass
+        print("Cleared %d model memor%s." % (n, "y" if n == 1 else "ies")); return
+    path = mem_file(MODEL)
+    if os.path.exists(path):
+        os.remove(path); print("Cleared memory for %s." % MODEL)
+    else:
+        print("No memory to clear for %s." % MODEL)
+
+MODE  = sys.argv[1] if len(sys.argv) > 1 else "list"
+MODEL = sys.argv[2] if len(sys.argv) > 2 else ""
+INIT  = " ".join(sys.argv[3:]).strip()
+
+if __name__ == "__main__":
+    try:
+        if   MODE == "chat":  do_chat()
+        elif MODE == "list":  do_list()
+        elif MODE == "show":  do_show()
+        elif MODE == "clear": do_clear()
+        else: sys.stderr.write("unknown memory mode: %s\n" % MODE); sys.exit(2)
+    except KeyboardInterrupt:
+        print("\nInterrupted.")
+PYEOF
+}
+
+cmd_remember() {
+  [ $# -ge 1 ] || die "Usage: fabmyth remember <model> [message]   (chat that remembers past sessions)"
+  ensure_server
+  local model="$1"; shift
+  local PYBIN
+  if have python3; then PYBIN=python3
+  elif have python; then PYBIN=python
+  else die "Memory needs Python. Install it:  pkg install python  |  apt install python3"
+  fi
+  if ! ollama list 2>/dev/null | awk 'NR>1{print $1}' | grep -qx "$model"; then
+    warn "'$model' isn't installed. Pulling it first…"
+    ollama pull "$model" || die "Could not pull $model"
+  fi
+  _write_memory_py
+  info "Memory chat with $model  (each model has its own memory)"
+  FABMYTH_PY="$PYBIN" FABMYTH_HOME="$FABMYTH_HOME" OLLAMA_HOST="$OLLAMA_HOST" \
+    "$PYBIN" "$FABMYTH_HOME/memory.py" chat "$model" "$@"
+}
+
+cmd_memory() {
+  local PYBIN
+  if have python3; then PYBIN=python3
+  elif have python; then PYBIN=python
+  else die "Memory needs Python. Install it:  pkg install python  |  apt install python3"
+  fi
+  _write_memory_py
+  local sub="${1:-list}"; shift || true
+  case "$sub" in
+    list|ls)     FABMYTH_HOME="$FABMYTH_HOME" "$PYBIN" "$FABMYTH_HOME/memory.py" list ;;
+    show)        [ $# -ge 1 ] || die "Usage: fabmyth memory show <model>"
+                 FABMYTH_HOME="$FABMYTH_HOME" "$PYBIN" "$FABMYTH_HOME/memory.py" show "$1" ;;
+    clear|rm)    [ $# -ge 1 ] || die "Usage: fabmyth memory clear <model>|--all"
+                 FABMYTH_HOME="$FABMYTH_HOME" "$PYBIN" "$FABMYTH_HOME/memory.py" clear "$1" ;;
+    where|dir)   say "$FABMYTH_HOME/memory" ;;
+    *)           die "Usage: fabmyth memory <list|show <model>|clear <model>|--all|where>" ;;
+  esac
+}
+
 cmd_list() {
   ensure_server
   ollama list
@@ -1042,6 +1258,12 @@ ${C_BOLD}Models${C_RESET}
   ps                    Show currently running models
   rm <model>            Remove an installed model
 
+${C_BOLD}Memory (per-model, persists across sessions)${C_RESET}
+  remember <model> [msg]  Chat that remembers past conversations with that model
+  memory list             List models that have saved memory
+  memory show <model>     Print a model's stored conversation
+  memory clear <model>    Erase one model's memory (or: memory clear --all)
+
 ${C_BOLD}Termux AgenticOS${C_RESET}
   agent <model> [task]  Let the model run shell / Python / JS and save files —
                         every action needs your approval. Files go to
@@ -1085,6 +1307,8 @@ main() {
     pull|download)     cmd_pull "$@" ;;
     run)               cmd_run "$@" ;;
     chat)              cmd_chat "$@" ;;
+    remember|memchat)  cmd_remember "$@" ;;
+    memory|mem)        cmd_memory "$@" ;;
     agent|agentic|agenticos) cmd_agent "$@" ;;
     web|api|webapi)    cmd_web "$@" ;;
     list|ls)           cmd_list "$@" ;;
