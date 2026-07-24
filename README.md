@@ -47,6 +47,18 @@ The installer only requires `bash` and `curl`. It places the `fabmyth` command
 on your PATH (`$PREFIX/bin` on Termux, `/usr/local/bin` or `~/.local/bin` on
 Linux).
 
+### Updating
+
+Once installed, update in place with:
+
+```bash
+fabmyth update
+```
+
+It fetches the latest `fabmyth`, keeps a backup at `~/.fabmyth/fabmyth.bak`, and
+replaces itself atomically. To pull from a specific branch (e.g. before a change
+is merged to `main`): `fabmyth update --branch <name>`.
+
 ## Quick start
 
 ```bash
@@ -77,6 +89,7 @@ On **Termux**, follow the dedicated walkthrough in
 | `fabmyth rm <model>` | Remove a model |
 | `fabmyth agent <model> [task]` | **Termux AgenticOS** — let the model act on your device (see below) |
 | `fabmyth web <model> [opts]` | **Web API** — serve a model + embeddable chat widget for your site (see below) |
+| `fabmyth update [--branch B]` | Self-update to the latest version |
 | `fabmyth logs [-f\|N]` | Show server logs |
 
 Run `fabmyth help` for the full list.

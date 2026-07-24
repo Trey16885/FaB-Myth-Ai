@@ -19,7 +19,7 @@
 # MIT License — Copyright (c) 2026 Trey16885
 set -euo pipefail
 
-FABMYTH_VERSION="0.3.0"
+FABMYTH_VERSION="0.4.0"
 
 # ---------------------------------------------------------------------------
 # Colors (disabled when not a TTY or NO_COLOR is set)
@@ -48,6 +48,9 @@ PID_FILE="$FABMYTH_HOME/ollama.pid"
 LOG_FILE="$FABMYTH_HOME/ollama.log"
 OLLAMA_HOST_DEFAULT="127.0.0.1:11434"
 export OLLAMA_HOST="${OLLAMA_HOST:-$OLLAMA_HOST_DEFAULT}"
+
+# Where `fabmyth update` fetches new versions from (override for testing/forks).
+FABMYTH_REPO_RAW="${FABMYTH_REPO_RAW:-https://raw.githubusercontent.com/Trey16885/FaB-Myth-Ai}"
 
 mkdir -p "$FABMYTH_HOME"
 
@@ -952,6 +955,69 @@ cmd_doctor() {
   fi
 }
 
+# Self-update: fetch the latest fabmyth and replace this script in place.
+cmd_update() {
+  local ref="main"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --branch|--ref) ref="${2:?--branch needs a value}"; shift 2 ;;
+      --branch=*|--ref=*) ref="${1#*=}"; shift ;;
+      -*) die "Unknown option: $1" ;;
+      *)  ref="$1"; shift ;;
+    esac
+  done
+  have curl || die "update needs curl."
+
+  # Resolve the actual file backing the running command.
+  local src="${BASH_SOURCE[0]:-$0}" self
+  self="$(cd "$(dirname "$src")" 2>/dev/null && pwd)/$(basename "$src")"
+  if [ ! -e "$self" ]; then
+    self="$(command -v fabmyth 2>/dev/null || true)"
+  fi
+  [ -n "$self" ] && [ -e "$self" ] || die "Couldn't locate the installed fabmyth to update."
+
+  local url="$FABMYTH_REPO_RAW/$ref/bin/fabmyth"
+  info "Checking for updates (ref: $ref)"
+  say "  target: $self"
+
+  # Write the temp file in the target's directory so the final move is an
+  # atomic same-filesystem rename (the running script's inode is untouched).
+  local dir; dir="$(dirname "$self")"
+  local tmp
+  if ! tmp="$(mktemp "$dir/.fabmyth.XXXXXX" 2>/dev/null)"; then
+    err "Can't write to $dir (permission denied)."
+    say "  Try:  sudo fabmyth update"
+    say "  or reinstall: curl -fsSL $FABMYTH_REPO_RAW/$ref/install.sh | bash"
+    return 1
+  fi
+
+  if ! curl -fsSL "$url" -o "$tmp"; then
+    rm -f "$tmp"; die "Download failed: $url  (check the branch name and your network)."
+  fi
+  if ! head -1 "$tmp" | grep -q '^#!/usr/bin/env bash' || ! grep -q 'FABMYTH_VERSION=' "$tmp"; then
+    rm -f "$tmp"; die "Downloaded file doesn't look like fabmyth — aborting (nothing changed)."
+  fi
+
+  local newver
+  newver="$(grep -m1 'FABMYTH_VERSION=' "$tmp" | sed -E 's/.*"([^"]+)".*/\1/')"
+  if [ "$newver" = "$FABMYTH_VERSION" ]; then
+    rm -f "$tmp"
+    ok "Already up to date (v$FABMYTH_VERSION)."
+    return 0
+  fi
+
+  cp -f "$self" "$FABMYTH_HOME/fabmyth.bak" 2>/dev/null || true
+  chmod 0755 "$tmp"
+  if mv -f "$tmp" "$self"; then
+    ok "Updated fabmyth: v$FABMYTH_VERSION -> v$newver"
+    say "  backup of the previous version: $FABMYTH_HOME/fabmyth.bak"
+  else
+    rm -f "$tmp"
+    err "Failed to replace $self."
+    return 1
+  fi
+}
+
 cmd_version() { say "FaB-Myth-Ai (fabmyth) v$FABMYTH_VERSION"; }
 
 cmd_help() {
@@ -989,6 +1055,7 @@ ${C_BOLD}Web API (embed on a website)${C_RESET}
 
 ${C_BOLD}Other${C_RESET}
   logs [-f|N]           Show server logs (-f to follow, N lines)
+  update [--branch B]   Update fabmyth to the latest version (self-update)
   version               Print version
   help                  This message
 
@@ -1025,6 +1092,7 @@ main() {
     rm|remove)         cmd_rm "$@" ;;
     search|browse)     cmd_search "$@" ;;
     logs|log)          cmd_logs "$@" ;;
+    update|upgrade|self-update) cmd_update "$@" ;;
     doctor)            cmd_doctor "$@" ;;
     version|--version|-v) cmd_version ;;
     help|--help|-h)    cmd_help ;;
