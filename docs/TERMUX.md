@@ -95,6 +95,28 @@ you what's safe. Rough guide:
 
 Models download over your network — grab them on Wi-Fi, not mobile data.
 
+## Termux AgenticOS — let the model do things on your phone
+
+`fabmyth agent` lets a local model run shell/Python/JS and save files on your
+device, approving each action yourself:
+
+```bash
+pkg install -y python        # required for the agent loop
+pkg install -y nodejs        # optional, only for JavaScript actions
+fabmyth agent llama3.2:3b "save a shopping list to list.txt"
+```
+
+- Every command or file is shown to you first — answer `y`/`N`/`a`/`q`.
+- Files land in **`/sdcard/FabMyth/<model>/`**, so you can open them in any
+  Android app (Files, a text editor, etc.). You may need to run
+  `termux-setup-storage` once and grant the storage permission so `/sdcard` is
+  writable.
+- Use `/bye` to leave, `/ws` to see the folder, `/reset` to clear history.
+
+Small models (1–3B) are hit-or-miss at following the action format — if the
+agent isn't emitting `fabmyth-` blocks, a 3B+ model (e.g. `llama3.2:3b`,
+`qwen2.5:3b`) tends to behave better.
+
 ## Keeping it running
 
 - **Prevent Android from killing Termux:** acquire a wakelock with

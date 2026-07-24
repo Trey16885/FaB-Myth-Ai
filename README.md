@@ -75,9 +75,45 @@ On **Termux**, follow the dedicated walkthrough in
 | `fabmyth chat` | Pick an installed model and chat |
 | `fabmyth list` / `ps` | List installed / running models |
 | `fabmyth rm <model>` | Remove a model |
+| `fabmyth agent <model> [task]` | **Termux AgenticOS** — let the model act on your device (see below) |
 | `fabmyth logs [-f\|N]` | Show server logs |
 
 Run `fabmyth help` for the full list.
+
+## Termux AgenticOS
+
+`fabmyth agent` turns a local model into a hands-on agent that can **run shell,
+Python, and JavaScript** and **save files** on your device — with a hard rule:
+**you approve every single action before it runs.**
+
+```bash
+fabmyth agent llama3.2:3b "make a file called notes.txt with a haiku in it"
+```
+
+How it works:
+
+- The model requests actions by emitting tagged fenced blocks — `fabmyth-sh`,
+  `fabmyth-py`, `fabmyth-js`, or `fabmyth-save <file>`. **Only these tagged
+  blocks ever run**, so ordinary code examples in its replies never execute.
+- Before anything runs, fabmyth shows you the exact command or file contents and
+  asks: `[y]es / [N]o / [a]ll this session / [q]uit`. The default is **No**.
+- The action's output is fed back to the model so it can chain steps toward the
+  goal, up to a per-task action limit.
+- Files the model creates are saved under **`<storage>/FabMyth/<ModelName>/`** —
+  on Termux that's `/sdcard/FabMyth/<model>/`, so you can open them in any
+  Android app. Paths are sandboxed to that folder (no `..` escapes, no absolute
+  paths). Set `FABMYTH_STORAGE` to change the base location.
+
+Requirements: Python (`pkg install python`) for the agent loop; Node.js
+(`pkg install nodejs`) only if you want the model to run JavaScript. Run
+`fabmyth doctor` to check.
+
+In-session commands: `/bye` to quit, `/reset` to clear history, `/ws` to print
+the workspace path.
+
+> **Heads up:** this executes model-generated code on your device. The approval
+> prompt is your safety gate — read each command before you approve it, and use
+> `[a]ll` only when you trust the whole task.
 
 ## How it works
 

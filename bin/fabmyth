@@ -19,7 +19,7 @@
 # MIT License — Copyright (c) 2026 Trey16885
 set -euo pipefail
 
-FABMYTH_VERSION="0.1.0"
+FABMYTH_VERSION="0.2.0"
 
 # ---------------------------------------------------------------------------
 # Colors (disabled when not a TTY or NO_COLOR is set)
@@ -328,6 +328,265 @@ cmd_chat() {
   ollama run "$model"
 }
 
+# ---------------------------------------------------------------------------
+# Termux AgenticOS — let the model take actions on the device, with consent
+# ---------------------------------------------------------------------------
+cmd_agent() {
+  [ $# -ge 1 ] || die "Usage: fabmyth agent <model> [initial task]   (e.g. fabmyth agent llama3.2:3b \"list my downloads\")"
+  ensure_server
+  local model="$1"; shift
+
+  local PYBIN
+  if have python3; then PYBIN=python3
+  elif have python; then PYBIN=python
+  else die "AgenticOS needs Python. Install it:  pkg install python  (Termux)  |  apt install python3 (Debian)"
+  fi
+
+  if ! ollama list 2>/dev/null | awk 'NR>1{print $1}' | grep -qx "$model"; then
+    warn "'$model' isn't installed. Pulling it first…"
+    ollama pull "$model" || die "Could not pull $model"
+  fi
+
+  # Write the embedded agent to disk so its stdin stays connected to the
+  # terminal (needed for the per-action consent prompts).
+  local agent_py="$FABMYTH_HOME/agentic.py"
+  cat > "$agent_py" <<'PYEOF'
+#!/usr/bin/env python3
+"""FaB-Myth AgenticOS: a consent-gated agent loop over any Ollama model.
+
+The model can act on the device by emitting fenced blocks tagged 'fabmyth-*'.
+Only those tagged blocks ever run, and only after the user approves each one.
+Files it creates land under  <storage>/FabMyth/<ModelName>/ .
+"""
+import os, sys, re, json, subprocess, tempfile
+import urllib.request, urllib.error
+
+HOST = os.environ.get("OLLAMA_HOST", "127.0.0.1:11434")
+BASE = HOST if HOST.startswith("http") else "http://" + HOST
+PYBIN = os.environ.get("FABMYTH_PY", "python3")
+
+TTY = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+def _c(x): return x if TTY else ""
+R=_c("\033[0m"); B=_c("\033[1m"); DIM=_c("\033[2m")
+RED=_c("\033[31m"); GRN=_c("\033[32m"); YEL=_c("\033[33m"); CYN=_c("\033[36m"); MAG=_c("\033[35m")
+
+MODEL = sys.argv[1] if len(sys.argv) > 1 else "llama3.2:3b"
+INIT  = " ".join(sys.argv[2:]).strip()
+
+def safe_name(m): return re.sub(r"[^A-Za-z0-9._-]", "_", m)
+
+def storage_base():
+    env = os.environ.get("FABMYTH_STORAGE")
+    if env: return env
+    for p in ("/sdcard", "/storage/emulated/0"):
+        if os.path.isdir(p): return p
+    return os.path.expanduser("~")
+
+WORKSPACE = os.path.join(storage_base(), "FabMyth", safe_name(MODEL))
+try:
+    os.makedirs(WORKSPACE, exist_ok=True)
+except PermissionError:
+    sys.stderr.write(
+        "Cannot create %s\nOn Termux, run:  termux-setup-storage  (then grant "
+        "storage permission), or set FABMYTH_STORAGE to a writable path.\n" % WORKSPACE)
+    sys.exit(1)
+
+SYSTEM = (
+    "You are FaB-Myth AgenticOS, an AI agent running on the user's device via "
+    "Termux/Linux. You can take real actions by emitting fenced code blocks with "
+    "one of these exact info tags. ONLY blocks with a 'fabmyth-' tag are executed, "
+    "and the user must approve every one before it runs.\n\n"
+    "Run a shell command:\n```fabmyth-sh\nls -la\n```\n\n"
+    "Run Python:\n```fabmyth-py\nprint('hi')\n```\n\n"
+    "Run JavaScript (Node.js):\n```fabmyth-js\nconsole.log('hi')\n```\n\n"
+    "Save a file (relative path, stored in your workspace):\n"
+    "```fabmyth-save notes.txt\nfile contents\n```\n\n"
+    "Rules:\n"
+    "- Emit a fabmyth- block ONLY when you actually want to run or save something; "
+    "otherwise just reply in plain text.\n"
+    "- After each action you receive its output in a message starting with [fabmyth]. "
+    "Use it to decide the next step.\n"
+    "- Your working directory IS the workspace folder; files you create stay there.\n"
+    "- Prefer small, safe commands. Never try to bypass the approval step.\n"
+    "- When the task is done, give a short plain-text summary with no action block.\n"
+    "Your workspace: " + WORKSPACE
+)
+
+ACTION_RE = re.compile(r"```fabmyth-([A-Za-z]+)[ \t]*([^\n]*)\n(.*?)```", re.DOTALL)
+SYNONYMS = {"sh":"shell","shell":"shell","bash":"shell",
+            "py":"python","python":"python",
+            "js":"js","javascript":"js","node":"js",
+            "save":"save","file":"save","write":"save"}
+
+def parse_actions(text):
+    out = []
+    for m in ACTION_RE.finditer(text):
+        kind = SYNONYMS.get(m.group(1).lower().strip())
+        if kind:
+            out.append((kind, m.group(2).strip(), m.group(3)))
+    return out
+
+MAXOUT = 6000
+def clip(s):
+    return s if len(s) <= MAXOUT else s[:MAXOUT] + "\n...[truncated %d chars]" % (len(s) - MAXOUT)
+
+def run_shell(body):
+    try:
+        p = subprocess.run(["bash","-c",body], cwd=WORKSPACE, capture_output=True,
+                           text=True, timeout=300)
+    except subprocess.TimeoutExpired:
+        return 124, "timed out after 300s"
+    out = p.stdout or ""
+    if p.stderr: out += "\n[stderr]\n" + p.stderr
+    return p.returncode, clip(out.strip())
+
+def run_code(kind, body):
+    suffix = ".py" if kind == "python" else ".js"
+    interp = [PYBIN] if kind == "python" else ["node"]
+    fd, path = tempfile.mkstemp(suffix=suffix, prefix="fabmyth_")
+    try:
+        with os.fdopen(fd, "w") as f:
+            f.write(body)
+        try:
+            p = subprocess.run(interp + [path], cwd=WORKSPACE, capture_output=True,
+                               text=True, timeout=300)
+        except FileNotFoundError:
+            pkg = "python" if kind == "python" else "nodejs"
+            return 127, "%s is not installed. Install it:  pkg install %s" % (interp[0], pkg)
+        except subprocess.TimeoutExpired:
+            return 124, "timed out after 300s"
+        out = p.stdout or ""
+        if p.stderr: out += "\n[stderr]\n" + p.stderr
+        return p.returncode, clip(out.strip())
+    finally:
+        try: os.remove(path)
+        except OSError: pass
+
+def save_file(arg, body):
+    name = arg.strip().strip('"').strip("'")
+    if not name:
+        return False, "no filename given"
+    if os.path.isabs(name) or ".." in name.split("/"):
+        return False, "refused unsafe path: " + name
+    dest = os.path.realpath(os.path.join(WORKSPACE, name))
+    root = os.path.realpath(WORKSPACE)
+    if not (dest == root or dest.startswith(root + os.sep)):
+        return False, "refused path outside workspace"
+    os.makedirs(os.path.dirname(dest), exist_ok=True)
+    with open(dest, "w") as f:
+        f.write(body)
+    return True, dest
+
+ALLOW_ALL = False
+LABEL = {"shell":"RUN SHELL","python":"RUN PYTHON","js":"RUN JAVASCRIPT","save":"SAVE FILE"}
+
+def consent(kind, arg, body):
+    global ALLOW_ALL
+    print()
+    print("%s>> %s %s%s" % (YEL + B, LABEL[kind], arg if kind == "save" else "", R))
+    print(DIM + "-" * 52 + R)
+    print(body.rstrip("\n"))
+    print(DIM + "-" * 52 + R)
+    if ALLOW_ALL:
+        print(GRN + "[auto-approved]" + R)
+        return True
+    try:
+        ans = input("%sApprove? [y]es / [N]o / [a]ll this session / [q]uit: %s" % (CYN, R)).strip().lower()
+    except EOFError:
+        return False
+    if ans == "q":
+        print("Quitting AgenticOS.")
+        sys.exit(0)
+    if ans == "a":
+        ALLOW_ALL = True
+        return True
+    return ans in ("y", "yes")
+
+def chat(messages):
+    data = json.dumps({"model": MODEL, "messages": messages, "stream": False}).encode()
+    req = urllib.request.Request(BASE + "/api/chat", data=data,
+                                 headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=600) as r:
+        return json.loads(r.read().decode())["message"]["content"]
+
+def main():
+    print("%sFaB-Myth AgenticOS%s  model=%s" % (B + MAG, R, MODEL))
+    print("  workspace : %s" % WORKSPACE)
+    print("  %severy action needs your approval. Commands: /bye /reset /ws%s" % (DIM, R))
+    print()
+
+    messages = [{"role": "system", "content": SYSTEM}]
+    pending = INIT or None
+
+    while True:
+        if pending is None:
+            try:
+                user = input("%syou>%s " % (B + CYN, R)).strip()
+            except EOFError:
+                print(); break
+            if not user:
+                continue
+            if user in ("/bye", "/exit", "/quit"):
+                break
+            if user == "/reset":
+                messages = messages[:1]; print("(history cleared)"); continue
+            if user == "/ws":
+                print(WORKSPACE); continue
+            messages.append({"role": "user", "content": user})
+        else:
+            messages.append({"role": "user", "content": pending}); pending = None
+
+        for _ in range(10):
+            try:
+                reply = chat(messages)
+            except urllib.error.URLError as e:
+                print(RED + "Cannot reach Ollama at %s: %s" % (BASE, e) + R); reply = None; break
+            except Exception as e:
+                print(RED + "Chat error: %s" % e + R); reply = None; break
+            messages.append({"role": "assistant", "content": reply})
+            print("\n%sassistant>%s %s" % (B + MAG, R, reply.strip()))
+            actions = parse_actions(reply)
+            if not actions:
+                break
+            results = []
+            for kind, arg, body in actions:
+                if not consent(kind, arg, body):
+                    results.append("[fabmyth] %s: user declined" % kind)
+                    print(YEL + "(declined)" + R)
+                    continue
+                if kind == "shell":
+                    rc, out = run_shell(body)
+                elif kind == "python":
+                    rc, out = run_code("python", body)
+                elif kind == "js":
+                    rc, out = run_code("js", body)
+                elif kind == "save":
+                    ok, info = save_file(arg, body)
+                    results.append("[fabmyth] save %s: %s" %
+                                   (arg, "saved -> " + info if ok else "FAILED: " + info))
+                    print((GRN + "saved " + info) if ok else (RED + "save failed: " + info), R)
+                    continue
+                results.append("[fabmyth] %s result (exit %d):\n%s" % (kind, rc, out or "(no output)"))
+                print(("%s%s exit %d%s" % (GRN if rc == 0 else RED, kind, rc, R)))
+                if out:
+                    print(DIM + out + R)
+            messages.append({"role": "user", "content": "\n\n".join(results)})
+        else:
+            print(YEL + "(reached the action limit for this task — tell me to continue if needed)" + R)
+
+    print("Goodbye. Files are in: %s" % WORKSPACE)
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nInterrupted.")
+PYEOF
+
+  info "Launching Termux AgenticOS with $model"
+  FABMYTH_PY="$PYBIN" OLLAMA_HOST="$OLLAMA_HOST" "$PYBIN" "$agent_py" "$model" "$@"
+}
+
 cmd_list() {
   ensure_server
   ollama list
@@ -411,6 +670,14 @@ cmd_doctor() {
   have tar  && check "tar"  ok || check "tar"  warn "needed for userspace install"
   have jq   && check "jq"   ok || check "jq"   warn "optional, nicer status output"
 
+  # AgenticOS prerequisites
+  if have python3 || have python; then
+    check "python (agent)" ok "AgenticOS ready"
+  else
+    check "python (agent)" warn "needed for 'fabmyth agent' — pkg install python"
+  fi
+  have node && check "node (agent js)" ok || check "node (agent js)" warn "optional, only for JS actions — pkg install nodejs"
+
   if have ollama; then
     check "ollama" ok "$(ollama --version 2>/dev/null | head -1)"
   else
@@ -465,6 +732,11 @@ ${C_BOLD}Models${C_RESET}
   ps                    Show currently running models
   rm <model>            Remove an installed model
 
+${C_BOLD}Termux AgenticOS${C_RESET}
+  agent <model> [task]  Let the model run shell / Python / JS and save files —
+                        every action needs your approval. Files go to
+                        <storage>/FabMyth/<model>/ (/sdcard on Termux).
+
 ${C_BOLD}Other${C_RESET}
   logs [-f|N]           Show server logs (-f to follow, N lines)
   version               Print version
@@ -474,8 +746,10 @@ ${C_BOLD}Quick start${C_RESET}
   fabmyth setup && fabmyth start
   fabmyth pull llama3.2:1b
   fabmyth chat
+  fabmyth agent llama3.2:3b "make a hello.txt file"
 
 Env: OLLAMA_HOST (default $OLLAMA_HOST_DEFAULT), FABMYTH_HOME ($FABMYTH_HOME)
+     FABMYTH_STORAGE (override AgenticOS file location)
 EOF
 }
 
@@ -493,6 +767,7 @@ main() {
     pull|download)     cmd_pull "$@" ;;
     run)               cmd_run "$@" ;;
     chat)              cmd_chat "$@" ;;
+    agent|agentic|agenticos) cmd_agent "$@" ;;
     list|ls)           cmd_list "$@" ;;
     ps)                cmd_ps "$@" ;;
     rm|remove)         cmd_rm "$@" ;;
