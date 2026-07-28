@@ -123,6 +123,27 @@ and `fabmyth image` reports exactly which files were created.
 >    weights. Image models are **not auto-pulled** (they're too big); you pull
 >    them deliberately.
 
+### Host an image model for everyone (no per-person download)
+
+If you want other people to make images *without each downloading the model*,
+run it on **one** machine and let them generate over HTTP:
+
+```bash
+fabmyth pull flux2-klein:4b            # 4GB, downloaded once on THIS host
+fabmyth image-web flux2-klein:4b       # serves an image generator + embed tag
+```
+
+It prints a single `<script>` tag (no key) that drops an image-generator widget
+onto any website — visitors type a prompt and get a picture back, generated on
+your host. The API is `POST /api/image` with `{"prompt":"..."}` → a
+`data:image/png;base64` image. Options: `--port`, `--host`, `--url` (public base
+for a tunnel/HTTPS front, same as the chat Web API).
+
+This is the *only* real way to spare people the download: the weights live on
+your host (downloaded once), and everyone else just sends prompts. The same two
+caveats apply — the host needs the model, and until Ollama's image gen reaches
+Linux the host must be a Mac.
+
 ## Memory — models that remember you
 
 Plain `chat` forgets everything when you close it. `fabmyth remember` is a chat

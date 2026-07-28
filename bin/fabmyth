@@ -19,7 +19,7 @@
 # MIT License — Copyright (c) 2026 Trey16885
 set -euo pipefail
 
-FABMYTH_VERSION="0.6.0"
+FABMYTH_VERSION="0.7.0"
 
 # ---------------------------------------------------------------------------
 # Colors (disabled when not a TTY or NO_COLOR is set)
@@ -1114,6 +1114,254 @@ cmd_image() {
   return "$rc"
 }
 
+# ---------------------------------------------------------------------------
+# Image host — run an image model on ONE machine and let others generate over
+# HTTP (no per-person download). One <script> tag embeds it on a website.
+# The host still needs the weights once; image gen is macOS-only for now.
+# ---------------------------------------------------------------------------
+cmd_image_web() {
+  ensure_server
+  local model="" port="8778" host="0.0.0.0" url=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --port)   port="${2:?--port needs a value}"; shift 2 ;;
+      --host)   host="${2:?--host needs a value}"; shift 2 ;;
+      --url)    url="${2:?--url needs a value}"; shift 2 ;;
+      --port=*) port="${1#*=}"; shift ;;
+      --host=*) host="${1#*=}"; shift ;;
+      --url=*)  url="${1#*=}"; shift ;;
+      -*)       die "Unknown option: $1" ;;
+      *)        if [ -z "$model" ]; then model="$1"; else die "Unexpected argument: $1"; fi; shift ;;
+    esac
+  done
+  [ -n "$model" ] || model="${FABMYTH_IMAGE_MODEL:-x/z-image-turbo:fp8}"
+
+  local PYBIN
+  if have python3; then PYBIN=python3
+  elif have python; then PYBIN=python
+  else die "The image host needs Python. Install it:  pkg install python  |  apt install python3"
+  fi
+
+  if ! ollama list 2>/dev/null | awk 'NR>1{print $1}' | grep -qx "$model"; then
+    err "'$model' isn't installed on this host."
+    say "  Image models are large — download it once on this machine:"
+    say "     ${C_BOLD}fabmyth pull $model${C_RESET}"
+    return 1
+  fi
+
+  if [ "$(uname -s)" != "Darwin" ]; then
+    warn "Ollama image generation is macOS-only for now; on $(platform_label) generation"
+    warn "may fail until Ollama ships Linux support. The server will still start."
+  fi
+
+  local iweb_py="$FABMYTH_HOME/imageweb.py"
+  cat > "$iweb_py" <<'PYEOF'
+#!/usr/bin/env python3
+"""FaB-Myth Image Host: run ONE image model and serve generation over HTTP so
+others don't each download the weights. One <script> tag embeds it on a site.
+
+Generation shells out to `ollama run <model> "<prompt>"` in a temp dir and
+returns the produced image, so it works regardless of the experimental image
+HTTP API's exact shape. No API key.
+"""
+import os, sys, json, socket, base64, glob, tempfile, shutil, subprocess, threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+MODEL = os.environ.get("FABMYTH_IMG_MODEL", "x/z-image-turbo:fp8")
+PORT  = int(os.environ.get("FABMYTH_IMG_PORT", "8778"))
+HOST  = os.environ.get("FABMYTH_IMG_HOST", "0.0.0.0")
+
+def guess_ip():
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80)); ip = s.getsockname()[0]; s.close(); return ip
+    except Exception:
+        return "127.0.0.1"
+
+PUBLIC_URL = os.environ.get("FABMYTH_IMG_URL", "").rstrip("/")
+if not PUBLIC_URL:
+    ip = guess_ip() if HOST in ("0.0.0.0", "::", "") else HOST
+    PUBLIC_URL = "http://%s:%d" % (ip, PORT)
+
+EMBED_TAG = '<script src="%s/img-embed.js"></script>' % PUBLIC_URL
+EMBED_TAG_ESC = EMBED_TAG.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+GEN_LOCK = threading.Lock()  # image gen is heavy: one at a time
+
+def generate(prompt):
+    """Returns (data_url, None) on success or (None, error_message)."""
+    with GEN_LOCK:
+        d = tempfile.mkdtemp(prefix="fabimg_")
+        try:
+            try:
+                p = subprocess.run(["ollama", "run", MODEL, prompt],
+                                   cwd=d, capture_output=True, text=True, timeout=600)
+            except FileNotFoundError:
+                return None, "ollama binary not found on host"
+            except subprocess.TimeoutExpired:
+                return None, "generation timed out (600s)"
+            imgs = []
+            for ext in ("*.png", "*.jpg", "*.jpeg", "*.webp"):
+                imgs += glob.glob(os.path.join(d, ext))
+            if not imgs:
+                msg = (p.stderr or p.stdout or "").strip() or "no image was produced"
+                return None, msg[:400]
+            imgs.sort(key=os.path.getmtime)
+            path = imgs[-1]
+            with open(path, "rb") as f:
+                data = f.read()
+            ext = os.path.splitext(path)[1].lstrip(".").lower()
+            mime = "image/jpeg" if ext in ("jpg", "jpeg") else "image/" + ext
+            return "data:%s;base64,%s" % (mime, base64.b64encode(data).decode()), None
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+EMBED_JS = r'''(function(){
+  var cs=document.currentScript;
+  if(!cs){var ss=document.getElementsByTagName('script');cs=ss[ss.length-1];}
+  var base=cs.src.replace(/\/img-embed\.js.*$/,'');
+  var title=cs.getAttribute('data-fabmyth-title')||'AI Image Generator';
+  var accent=cs.getAttribute('data-fabmyth-color')||'#4f46e5';
+  var css=[
+   '.fmi-btn{position:fixed;right:20px;bottom:20px;z-index:2147483000;width:56px;height:56px;border-radius:50%;border:none;cursor:pointer;box-shadow:0 6px 20px rgba(0,0,0,.25);font-size:24px;color:#fff;background:'+accent+'}',
+   '.fmi-panel{position:fixed;right:20px;bottom:88px;z-index:2147483000;width:min(380px,94vw);background:#fff;color:#111;border-radius:14px;box-shadow:0 12px 40px rgba(0,0,0,.3);display:none;flex-direction:column;overflow:hidden;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif}',
+   '.fmi-panel.open{display:flex}',
+   '.fmi-head{background:'+accent+';color:#fff;padding:12px 14px;font-weight:600;display:flex;justify-content:space-between;align-items:center}',
+   '.fmi-x{cursor:pointer;background:none;border:none;color:#fff;font-size:20px;line-height:1}',
+   '.fmi-body{padding:12px;display:flex;flex-direction:column;gap:8px}',
+   '.fmi-img{width:100%;border-radius:10px;display:none;background:#f0f0f2;min-height:40px}',
+   '.fmi-in{border:1px solid #d1d5db;border-radius:10px;padding:9px 11px;font-size:14px;outline:none;width:100%}',
+   '.fmi-go{border:none;background:'+accent+';color:#fff;border-radius:10px;padding:10px;cursor:pointer;font-size:14px}',
+   '.fmi-go:disabled{opacity:.6;cursor:default}',
+   '.fmi-status{font-size:12px;color:#6b7280;min-height:16px}',
+   '.fmi-cred{font-size:11px;color:#9ca3af;text-align:center;padding:4px}',
+   '@media (prefers-color-scheme:dark){.fmi-panel{background:#1f2023;color:#eee}.fmi-in{background:#26272b;color:#eee;border-color:#3a3b40}.fmi-img{background:#17181a}}'
+  ].join('');
+  var st=document.createElement('style');st.textContent=css;document.head.appendChild(st);
+  var btn=document.createElement('button');btn.className='fmi-btn';btn.innerHTML='&#127912;';btn.title=title;
+  var panel=document.createElement('div');panel.className='fmi-panel';
+  panel.innerHTML='<div class="fmi-head"><span></span><button class="fmi-x" aria-label="close">&times;</button></div>'+
+    '<div class="fmi-body">'+
+    '<img class="fmi-img" alt="generated image">'+
+    '<input class="fmi-in" placeholder="Describe an image...">'+
+    '<button class="fmi-go">Generate</button>'+
+    '<div class="fmi-status"></div></div>'+
+    '<div class="fmi-cred">powered by FaB-Myth-Ai</div>';
+  document.body.appendChild(btn);document.body.appendChild(panel);
+  panel.querySelector('.fmi-head span').textContent=title;
+  var img=panel.querySelector('.fmi-img'),input=panel.querySelector('.fmi-in'),go=panel.querySelector('.fmi-go'),status=panel.querySelector('.fmi-status');
+  function toggle(open){panel.classList.toggle('open',open);if(open)input.focus();}
+  btn.onclick=function(){toggle(!panel.classList.contains('open'));};
+  panel.querySelector('.fmi-x').onclick=function(){toggle(false);};
+  var busy=false;
+  function gen(){
+    var prompt=(input.value||'').trim();if(!prompt||busy)return;
+    busy=true;go.disabled=true;status.textContent='Generating (this can take a bit)...';
+    fetch(base+'/api/image',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt:prompt})})
+     .then(function(r){return r.json();})
+     .then(function(j){
+       if(j.image){img.src=j.image;img.style.display='block';status.textContent='';}
+       else{status.textContent='Error: '+(j.error||'failed');}
+     })
+     .catch(function(e){status.textContent='Network error: '+e;})
+     .then(function(){busy=false;go.disabled=false;});
+  }
+  go.onclick=gen;
+  input.addEventListener('keydown',function(e){if(e.key==='Enter'){e.preventDefault();gen();}});
+})();'''
+
+DEMO_TMPL = '''<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>FaB-Myth Image Host - __MODEL__</title>
+<style>body{font-family:system-ui,-apple-system,sans-serif;max-width:720px;margin:40px auto;padding:0 16px;line-height:1.55;color:#111}h1{margin-bottom:2px}code,pre{background:#f3f4f6;border-radius:6px}pre{padding:14px;overflow:auto;white-space:pre-wrap;word-break:break-all}small{color:#666}button.copy{margin-top:6px;padding:8px 12px;border:1px solid #d1d5db;border-radius:8px;background:#fff;cursor:pointer}@media(prefers-color-scheme:dark){body{background:#111;color:#eee}code,pre{background:#1e1e22}button.copy{background:#26272b;color:#eee;border-color:#3a3b40}}</style>
+</head><body>
+<h1>FaB-Myth Image Host</h1>
+<small>Serving <b>__MODEL__</b> &mdash; visitors generate images here without downloading the model. No API key.</small>
+<h2>Add it to your website</h2>
+<p>Paste this one tag before <code>&lt;/body&gt;</code>:</p>
+<pre id="tag">__TAGESC__</pre>
+<button class="copy" onclick="navigator.clipboard.writeText(document.getElementById('tag').textContent);this.textContent='Copied!'">Copy tag</button>
+<h2>Live preview</h2>
+<p>Use the paint-palette button in the bottom-right of this page to generate an image.</p>
+<p><small>Endpoint: <code>POST __URL__/api/image</code> body <code>{"prompt":"..."}</code> &middot; health: <code>__URL__/health</code></small></p>
+__TAG__
+</body></html>'''
+DEMO_HTML = (DEMO_TMPL.replace("__MODEL__", MODEL)
+                      .replace("__URL__", PUBLIC_URL)
+                      .replace("__TAGESC__", EMBED_TAG_ESC)
+                      .replace("__TAG__", EMBED_TAG))
+
+class Handler(BaseHTTPRequestHandler):
+    def _cors(self):
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+    def _send(self, code, body, ctype="application/json"):
+        if isinstance(body, str): body = body.encode()
+        self.send_response(code); self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body))); self._cors(); self.end_headers()
+        self.wfile.write(body)
+    def do_OPTIONS(self):
+        self.send_response(204); self._cors(); self.end_headers()
+    def do_GET(self):
+        p = self.path.split("?")[0]
+        if p == "/img-embed.js":
+            self._send(200, EMBED_JS, "application/javascript; charset=utf-8")
+        elif p in ("/", "/index.html", "/demo"):
+            self._send(200, DEMO_HTML, "text/html; charset=utf-8")
+        elif p == "/health":
+            self._send(200, json.dumps({"ok": True, "model": MODEL}))
+        else:
+            self._send(404, json.dumps({"error": "not found"}))
+    def do_POST(self):
+        if self.path.split("?")[0] != "/api/image":
+            self._send(404, json.dumps({"error": "not found"})); return
+        try:
+            ln = int(self.headers.get("Content-Length", 0))
+            payload = json.loads(self.rfile.read(ln).decode() or "{}")
+        except Exception:
+            self._send(400, json.dumps({"error": "invalid JSON"})); return
+        prompt = (payload.get("prompt") or "").strip()
+        if not prompt:
+            self._send(400, json.dumps({"error": "no prompt provided"})); return
+        data_url, err = generate(prompt[:2000])
+        if err:
+            self._send(502, json.dumps({"error": err})); return
+        self._send(200, json.dumps({"image": data_url, "model": MODEL}))
+    def log_message(self, *a):
+        pass
+
+def main():
+    print("FaB-Myth Image Host")
+    print("  model      : %s" % MODEL)
+    print("  binding    : %s:%d" % (HOST, PORT))
+    print("  public url : %s" % PUBLIC_URL)
+    print()
+    print("Paste this ONE tag into your website (no API key needed):")
+    print()
+    print("    " + EMBED_TAG)
+    print()
+    print("Preview / copy page: %s" % PUBLIC_URL)
+    print("Visitors generate images via this host -- they never download the model.")
+    print("Press Ctrl-C to stop.")
+    print()
+    try:
+        ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()
+    except KeyboardInterrupt:
+        print("\nStopped.")
+    except OSError as e:
+        sys.stderr.write("Could not bind %s:%d -- %s\n" % (HOST, PORT, e)); sys.exit(1)
+
+if __name__ == "__main__":
+    main()
+PYEOF
+
+  info "Starting FaB-Myth Image Host for $model"
+  FABMYTH_IMG_MODEL="$model" FABMYTH_IMG_PORT="$port" FABMYTH_IMG_HOST="$host" \
+  FABMYTH_IMG_URL="$url" OLLAMA_HOST="$OLLAMA_HOST" \
+  "$PYBIN" "$iweb_py"
+}
+
 cmd_list() {
   ensure_server
   ollama list
@@ -1331,8 +1579,11 @@ ${C_BOLD}Memory (per-model, persists across sessions)${C_RESET}
   memory clear <model>    Erase one model's memory (or: memory clear --all)
 
 ${C_BOLD}Images (experimental; Ollama image gen is macOS-only for now)${C_RESET}
-  image [model] "prompt"  Generate an image (default model x/z-image-turbo:fp8)
+  image [model] "prompt"  Generate an image locally (default x/z-image-turbo:fp8)
                           Saves to \$FABMYTH_IMAGE_DIR or the current directory
+  image-web [model]       Host an image model so others generate over HTTP
+                          (they never download it). Prints a <script> tag.
+                          Options: --port N  --host H  --url URL
 
 ${C_BOLD}Termux AgenticOS${C_RESET}
   agent <model> [task]  Let the model run shell / Python / JS and save files —
@@ -1380,6 +1631,7 @@ main() {
     remember|memchat)  cmd_remember "$@" ;;
     memory|mem)        cmd_memory "$@" ;;
     image|img|imagine) cmd_image "$@" ;;
+    image-web|imghost|webimage) cmd_image_web "$@" ;;
     agent|agentic|agenticos) cmd_agent "$@" ;;
     web|api|webapi)    cmd_web "$@" ;;
     list|ls)           cmd_list "$@" ;;
