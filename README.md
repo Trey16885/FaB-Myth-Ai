@@ -87,14 +87,115 @@ On **Termux**, follow the dedicated walkthrough in
 | `fabmyth chat` | Pick an installed model and chat |
 | `fabmyth list` / `ps` | List installed / running models |
 | `fabmyth rm <model>` | Remove a model |
+| `fabmyth image [model] "prompt"` | Generate images with Ollama's image models (see below) |
 | `fabmyth remember <model> [msg]` | Chat with **persistent per-model memory** (see below) |
 | `fabmyth memory <list\|show\|clear>` | Manage saved memories |
 | `fabmyth agent <model> [task]` | **Termux AgenticOS** — let the model act on your device (see below) |
 | `fabmyth web <model> [opts]` | **Web API** — serve a model + embeddable chat widget for your site (see below) |
+| `fabmyth site [model] [opts]` | Generate a ready-to-host chat **website** (no coding) |
+| `fabmyth API <name>` | **Forever API** — reusable API key for any device/site (see below) |
 | `fabmyth update [--branch B]` | Self-update to the latest version |
 | `fabmyth logs [-f\|N]` | Show server logs |
 
 Run `fabmyth help` for the full list.
+
+## Image generation
+
+`fabmyth image` wraps Ollama's (experimental) text-to-image support, so you can
+generate pictures from a prompt with models like **`x/z-image-turbo`**:
+
+```bash
+fabmyth pull x/z-image-turbo:fp8          # 13GB (fp8); :bf16 is 33GB, higher quality
+fabmyth image "a red fox asleep in the snow, golden hour"
+# or name the model explicitly:
+fabmyth image x/z-image-turbo:fp8 "a neon city street in the rain"
+```
+
+Images are saved to `$FABMYTH_IMAGE_DIR` (defaults to the current directory),
+and `fabmyth image` reports exactly which files were created.
+
+> **Two honest caveats:**
+> 1. **Ollama's image generation is macOS-only right now** (experimental, added
+>    Jan 2026). On **Linux/Termux** — FaB-Myth's main target — it won't generate
+>    until Ollama ships Linux support. `fabmyth image` warns you and still tries,
+>    so it lights up automatically once that lands.
+> 2. **There's no way to run a model without its weights.** The host downloads
+>    the model once (13GB fp8). "Nobody downloads it" is only achievable by
+>    running it on one machine and calling it remotely — not by skipping the
+>    weights. Image models are **not auto-pulled** (they're too big); you pull
+>    them deliberately.
+
+### Host an image model for everyone (no per-person download)
+
+If you want other people to make images *without each downloading the model*,
+run it on **one** machine and let them generate over HTTP:
+
+```bash
+fabmyth pull flux2-klein:4b            # 4GB, downloaded once on THIS host
+fabmyth image-web flux2-klein:4b       # serves an image generator + embed tag
+```
+
+It prints a single `<script>` tag (no key) that drops an image-generator widget
+onto any website — visitors type a prompt and get a picture back, generated on
+your host. The API is `POST /api/image` with `{"prompt":"..."}` → a
+`data:image/png;base64` image. Options: `--port`, `--host`, `--url` (public base
+for a tunnel/HTTPS front, same as the chat Web API).
+
+This is the *only* real way to spare people the download: the weights live on
+your host (downloaded once), and everyone else just sends prompts. The same two
+caveats apply — the host needs the model, and until Ollama's image gen reaches
+Linux the host must be a Mac.
+
+## No-code website (`fabmyth site`)
+
+Don't want to write any HTML? Generate a complete chat website in one command:
+
+```bash
+fabmyth site --api http://192.168.1.50:8777        # plain Web API
+# or point it at the Forever API with a key:
+fabmyth site qwen2.5:3b --api http://192.168.1.50:8899 --key fmk_... --title "My Bot"
+```
+
+It writes a self-contained `index.html` (a full-page chat UI) to
+`./fabmyth-site/` (or `--out DIR`). Host that folder anywhere — GitHub Pages,
+Netlify, a USB stick — no build step, no dependencies. Options: `--out`, `--api`,
+`--key`, `--title`.
+
+## Forever API — one key, any device or site
+
+The Web API is single-model and keyless. The **Forever API** gives you a
+**reusable key** that works from any website or device, and lets callers pick
+which model to use.
+
+```bash
+fabmyth API mykey        # create a key -> prints fmk_XXXXXXXX... (once)
+fabmyth API list         # list your keys (secret masked)
+fabmyth API rm mykey     # delete a key
+fabmyth API serve        # run the key-authenticated server (port 8899)
+```
+
+Call it from anywhere with a JSON body:
+
+```json
+{ "key": "fmk_...", "model": "default", "message": "Hello!" }
+```
+
+- **`model`** — `"default"` uses `llama3.2:1b`; or name any model you've pulled
+  on the host (e.g. `"qwen2.5:3b"`), so **one key can serve several models** you
+  host.
+- The key can be sent in the body (`"key"`) or as an `Authorization: Bearer ...`
+  header. Invalid/missing keys get HTTP 401. Keys are reloaded on every request,
+  so new keys work instantly and deleted keys stop working immediately.
+
+Ready-made **examples** (HTML, JavaScript, and Python with `requests`) live in
+the [`examples/`](examples/) folder — copy one, drop in your `API_URL` and
+`API_KEY`, done.
+
+> Keys are stored on the host in `~/.fabmyth/api_keys.json`. The server binds to
+> all interfaces so other devices on your network can reach it; for public use,
+> front it with an HTTPS tunnel and pass `--url`. There's no way around the host
+> needing to run — the key authenticates callers, it doesn't run the model
+> remotely by itself.
 
 ## Memory — models that remember you
 

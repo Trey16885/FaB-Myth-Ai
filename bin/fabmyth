@@ -19,7 +19,7 @@
 # MIT License — Copyright (c) 2026 Trey16885
 set -euo pipefail
 
-FABMYTH_VERSION="0.5.0"
+FABMYTH_VERSION="0.8.0"
 
 # ---------------------------------------------------------------------------
 # Colors (disabled when not a TTY or NO_COLOR is set)
@@ -1050,6 +1050,661 @@ cmd_memory() {
   esac
 }
 
+# ---------------------------------------------------------------------------
+# Image generation — wraps Ollama's (experimental) text-to-image support.
+# Models like x/z-image-turbo:fp8 (13GB) / :bf16 (33GB). NOTE: as of 2026
+# Ollama image generation is macOS-only; Linux/Termux support is pending.
+# ---------------------------------------------------------------------------
+cmd_image() {
+  ensure_server
+
+  # First token is the model only if it looks like a bare model ref (no spaces);
+  # otherwise everything is the prompt and we use a default image model.
+  local model
+  if [ $# -ge 2 ] && printf '%s' "$1" | grep -qE '^[A-Za-z0-9._/-]+(:[A-Za-z0-9._-]+)?$'; then
+    model="$1"; shift
+  else
+    model="${FABMYTH_IMAGE_MODEL:-x/z-image-turbo:fp8}"
+  fi
+  local prompt="$*"
+  [ -n "$prompt" ] || die "Usage: fabmyth image [model] \"<prompt>\"   (e.g. fabmyth image \"a red fox in snow\")"
+
+  # Platform reality check (don't hard-block — the situation is evolving).
+  if [ "$(uname -s)" != "Darwin" ]; then
+    warn "Ollama image generation is currently macOS-only (experimental)."
+    warn "On $(platform_label) this may fail until Ollama ships Linux support — trying anyway."
+  fi
+
+  # These models are big; never auto-pull tens of GB. Ask the user to opt in.
+  if ! ollama list 2>/dev/null | awk 'NR>1{print $1}' | grep -qx "$model"; then
+    err "'$model' isn't installed."
+    say "  Image models are large (x/z-image-turbo:fp8 ~13GB, :bf16 ~33GB)."
+    say "  Download it explicitly when you're ready:"
+    say "     ${C_BOLD}fabmyth pull $model${C_RESET}"
+    return 1
+  fi
+
+  local outdir="${FABMYTH_IMAGE_DIR:-$PWD}"
+  mkdir -p "$outdir" 2>/dev/null || die "Can't write to output dir: $outdir"
+
+  info "Generating with $model → $outdir"
+  say  "  prompt: $prompt"
+
+  # Ollama saves generated images into the working directory; run there and
+  # diff the listing to report exactly what was created.
+  local before after
+  before="$(ls -1 "$outdir" 2>/dev/null | sort)"
+  ( cd "$outdir" && ollama run "$model" "$prompt" )
+  local rc=$?
+  after="$(ls -1 "$outdir" 2>/dev/null | sort)"
+
+  local newfiles
+  newfiles="$(comm -13 <(printf '%s\n' "$before") <(printf '%s\n' "$after") \
+              | grep -iE '\.(png|jpg|jpeg|webp)$' || true)"
+  if [ -n "$newfiles" ]; then
+    ok "Created:"
+    printf '%s\n' "$newfiles" | while IFS= read -r f; do [ -n "$f" ] && say "  $outdir/$f"; done
+  elif [ "$rc" != 0 ]; then
+    err "Image generation failed (exit $rc)."
+    say "  If you're on Linux/Termux, Ollama's image support likely isn't available yet."
+  else
+    warn "No new image files detected in $outdir."
+    say  "  The model may have printed output inline, or saved elsewhere — check above."
+  fi
+  return "$rc"
+}
+
+# ---------------------------------------------------------------------------
+# Image host — run an image model on ONE machine and let others generate over
+# HTTP (no per-person download). One <script> tag embeds it on a website.
+# The host still needs the weights once; image gen is macOS-only for now.
+# ---------------------------------------------------------------------------
+cmd_image_web() {
+  ensure_server
+  local model="" port="8778" host="0.0.0.0" url=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --port)   port="${2:?--port needs a value}"; shift 2 ;;
+      --host)   host="${2:?--host needs a value}"; shift 2 ;;
+      --url)    url="${2:?--url needs a value}"; shift 2 ;;
+      --port=*) port="${1#*=}"; shift ;;
+      --host=*) host="${1#*=}"; shift ;;
+      --url=*)  url="${1#*=}"; shift ;;
+      -*)       die "Unknown option: $1" ;;
+      *)        if [ -z "$model" ]; then model="$1"; else die "Unexpected argument: $1"; fi; shift ;;
+    esac
+  done
+  [ -n "$model" ] || model="${FABMYTH_IMAGE_MODEL:-x/z-image-turbo:fp8}"
+
+  local PYBIN
+  if have python3; then PYBIN=python3
+  elif have python; then PYBIN=python
+  else die "The image host needs Python. Install it:  pkg install python  |  apt install python3"
+  fi
+
+  if ! ollama list 2>/dev/null | awk 'NR>1{print $1}' | grep -qx "$model"; then
+    err "'$model' isn't installed on this host."
+    say "  Image models are large — download it once on this machine:"
+    say "     ${C_BOLD}fabmyth pull $model${C_RESET}"
+    return 1
+  fi
+
+  if [ "$(uname -s)" != "Darwin" ]; then
+    warn "Ollama image generation is macOS-only for now; on $(platform_label) generation"
+    warn "may fail until Ollama ships Linux support. The server will still start."
+  fi
+
+  local iweb_py="$FABMYTH_HOME/imageweb.py"
+  cat > "$iweb_py" <<'PYEOF'
+#!/usr/bin/env python3
+"""FaB-Myth Image Host: run ONE image model and serve generation over HTTP so
+others don't each download the weights. One <script> tag embeds it on a site.
+
+Generation shells out to `ollama run <model> "<prompt>"` in a temp dir and
+returns the produced image, so it works regardless of the experimental image
+HTTP API's exact shape. No API key.
+"""
+import os, sys, json, socket, base64, glob, tempfile, shutil, subprocess, threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+MODEL = os.environ.get("FABMYTH_IMG_MODEL", "x/z-image-turbo:fp8")
+PORT  = int(os.environ.get("FABMYTH_IMG_PORT", "8778"))
+HOST  = os.environ.get("FABMYTH_IMG_HOST", "0.0.0.0")
+
+def guess_ip():
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.connect(("8.8.8.8", 80)); ip = s.getsockname()[0]; s.close(); return ip
+    except Exception:
+        return "127.0.0.1"
+
+PUBLIC_URL = os.environ.get("FABMYTH_IMG_URL", "").rstrip("/")
+if not PUBLIC_URL:
+    ip = guess_ip() if HOST in ("0.0.0.0", "::", "") else HOST
+    PUBLIC_URL = "http://%s:%d" % (ip, PORT)
+
+EMBED_TAG = '<script src="%s/img-embed.js"></script>' % PUBLIC_URL
+EMBED_TAG_ESC = EMBED_TAG.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+GEN_LOCK = threading.Lock()  # image gen is heavy: one at a time
+
+def generate(prompt):
+    """Returns (data_url, None) on success or (None, error_message)."""
+    with GEN_LOCK:
+        d = tempfile.mkdtemp(prefix="fabimg_")
+        try:
+            try:
+                p = subprocess.run(["ollama", "run", MODEL, prompt],
+                                   cwd=d, capture_output=True, text=True, timeout=600)
+            except FileNotFoundError:
+                return None, "ollama binary not found on host"
+            except subprocess.TimeoutExpired:
+                return None, "generation timed out (600s)"
+            imgs = []
+            for ext in ("*.png", "*.jpg", "*.jpeg", "*.webp"):
+                imgs += glob.glob(os.path.join(d, ext))
+            if not imgs:
+                msg = (p.stderr or p.stdout or "").strip() or "no image was produced"
+                return None, msg[:400]
+            imgs.sort(key=os.path.getmtime)
+            path = imgs[-1]
+            with open(path, "rb") as f:
+                data = f.read()
+            ext = os.path.splitext(path)[1].lstrip(".").lower()
+            mime = "image/jpeg" if ext in ("jpg", "jpeg") else "image/" + ext
+            return "data:%s;base64,%s" % (mime, base64.b64encode(data).decode()), None
+        finally:
+            shutil.rmtree(d, ignore_errors=True)
+
+EMBED_JS = r'''(function(){
+  var cs=document.currentScript;
+  if(!cs){var ss=document.getElementsByTagName('script');cs=ss[ss.length-1];}
+  var base=cs.src.replace(/\/img-embed\.js.*$/,'');
+  var title=cs.getAttribute('data-fabmyth-title')||'AI Image Generator';
+  var accent=cs.getAttribute('data-fabmyth-color')||'#4f46e5';
+  var css=[
+   '.fmi-btn{position:fixed;right:20px;bottom:20px;z-index:2147483000;width:56px;height:56px;border-radius:50%;border:none;cursor:pointer;box-shadow:0 6px 20px rgba(0,0,0,.25);font-size:24px;color:#fff;background:'+accent+'}',
+   '.fmi-panel{position:fixed;right:20px;bottom:88px;z-index:2147483000;width:min(380px,94vw);background:#fff;color:#111;border-radius:14px;box-shadow:0 12px 40px rgba(0,0,0,.3);display:none;flex-direction:column;overflow:hidden;font-family:system-ui,-apple-system,Segoe UI,Roboto,sans-serif}',
+   '.fmi-panel.open{display:flex}',
+   '.fmi-head{background:'+accent+';color:#fff;padding:12px 14px;font-weight:600;display:flex;justify-content:space-between;align-items:center}',
+   '.fmi-x{cursor:pointer;background:none;border:none;color:#fff;font-size:20px;line-height:1}',
+   '.fmi-body{padding:12px;display:flex;flex-direction:column;gap:8px}',
+   '.fmi-img{width:100%;border-radius:10px;display:none;background:#f0f0f2;min-height:40px}',
+   '.fmi-in{border:1px solid #d1d5db;border-radius:10px;padding:9px 11px;font-size:14px;outline:none;width:100%}',
+   '.fmi-go{border:none;background:'+accent+';color:#fff;border-radius:10px;padding:10px;cursor:pointer;font-size:14px}',
+   '.fmi-go:disabled{opacity:.6;cursor:default}',
+   '.fmi-status{font-size:12px;color:#6b7280;min-height:16px}',
+   '.fmi-cred{font-size:11px;color:#9ca3af;text-align:center;padding:4px}',
+   '@media (prefers-color-scheme:dark){.fmi-panel{background:#1f2023;color:#eee}.fmi-in{background:#26272b;color:#eee;border-color:#3a3b40}.fmi-img{background:#17181a}}'
+  ].join('');
+  var st=document.createElement('style');st.textContent=css;document.head.appendChild(st);
+  var btn=document.createElement('button');btn.className='fmi-btn';btn.innerHTML='&#127912;';btn.title=title;
+  var panel=document.createElement('div');panel.className='fmi-panel';
+  panel.innerHTML='<div class="fmi-head"><span></span><button class="fmi-x" aria-label="close">&times;</button></div>'+
+    '<div class="fmi-body">'+
+    '<img class="fmi-img" alt="generated image">'+
+    '<input class="fmi-in" placeholder="Describe an image...">'+
+    '<button class="fmi-go">Generate</button>'+
+    '<div class="fmi-status"></div></div>'+
+    '<div class="fmi-cred">powered by FaB-Myth-Ai</div>';
+  document.body.appendChild(btn);document.body.appendChild(panel);
+  panel.querySelector('.fmi-head span').textContent=title;
+  var img=panel.querySelector('.fmi-img'),input=panel.querySelector('.fmi-in'),go=panel.querySelector('.fmi-go'),status=panel.querySelector('.fmi-status');
+  function toggle(open){panel.classList.toggle('open',open);if(open)input.focus();}
+  btn.onclick=function(){toggle(!panel.classList.contains('open'));};
+  panel.querySelector('.fmi-x').onclick=function(){toggle(false);};
+  var busy=false;
+  function gen(){
+    var prompt=(input.value||'').trim();if(!prompt||busy)return;
+    busy=true;go.disabled=true;status.textContent='Generating (this can take a bit)...';
+    fetch(base+'/api/image',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({prompt:prompt})})
+     .then(function(r){return r.json();})
+     .then(function(j){
+       if(j.image){img.src=j.image;img.style.display='block';status.textContent='';}
+       else{status.textContent='Error: '+(j.error||'failed');}
+     })
+     .catch(function(e){status.textContent='Network error: '+e;})
+     .then(function(){busy=false;go.disabled=false;});
+  }
+  go.onclick=gen;
+  input.addEventListener('keydown',function(e){if(e.key==='Enter'){e.preventDefault();gen();}});
+})();'''
+
+DEMO_TMPL = '''<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>FaB-Myth Image Host - __MODEL__</title>
+<style>body{font-family:system-ui,-apple-system,sans-serif;max-width:720px;margin:40px auto;padding:0 16px;line-height:1.55;color:#111}h1{margin-bottom:2px}code,pre{background:#f3f4f6;border-radius:6px}pre{padding:14px;overflow:auto;white-space:pre-wrap;word-break:break-all}small{color:#666}button.copy{margin-top:6px;padding:8px 12px;border:1px solid #d1d5db;border-radius:8px;background:#fff;cursor:pointer}@media(prefers-color-scheme:dark){body{background:#111;color:#eee}code,pre{background:#1e1e22}button.copy{background:#26272b;color:#eee;border-color:#3a3b40}}</style>
+</head><body>
+<h1>FaB-Myth Image Host</h1>
+<small>Serving <b>__MODEL__</b> &mdash; visitors generate images here without downloading the model. No API key.</small>
+<h2>Add it to your website</h2>
+<p>Paste this one tag before <code>&lt;/body&gt;</code>:</p>
+<pre id="tag">__TAGESC__</pre>
+<button class="copy" onclick="navigator.clipboard.writeText(document.getElementById('tag').textContent);this.textContent='Copied!'">Copy tag</button>
+<h2>Live preview</h2>
+<p>Use the paint-palette button in the bottom-right of this page to generate an image.</p>
+<p><small>Endpoint: <code>POST __URL__/api/image</code> body <code>{"prompt":"..."}</code> &middot; health: <code>__URL__/health</code></small></p>
+__TAG__
+</body></html>'''
+DEMO_HTML = (DEMO_TMPL.replace("__MODEL__", MODEL)
+                      .replace("__URL__", PUBLIC_URL)
+                      .replace("__TAGESC__", EMBED_TAG_ESC)
+                      .replace("__TAG__", EMBED_TAG))
+
+class Handler(BaseHTTPRequestHandler):
+    def _cors(self):
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+    def _send(self, code, body, ctype="application/json"):
+        if isinstance(body, str): body = body.encode()
+        self.send_response(code); self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body))); self._cors(); self.end_headers()
+        self.wfile.write(body)
+    def do_OPTIONS(self):
+        self.send_response(204); self._cors(); self.end_headers()
+    def do_GET(self):
+        p = self.path.split("?")[0]
+        if p == "/img-embed.js":
+            self._send(200, EMBED_JS, "application/javascript; charset=utf-8")
+        elif p in ("/", "/index.html", "/demo"):
+            self._send(200, DEMO_HTML, "text/html; charset=utf-8")
+        elif p == "/health":
+            self._send(200, json.dumps({"ok": True, "model": MODEL}))
+        else:
+            self._send(404, json.dumps({"error": "not found"}))
+    def do_POST(self):
+        if self.path.split("?")[0] != "/api/image":
+            self._send(404, json.dumps({"error": "not found"})); return
+        try:
+            ln = int(self.headers.get("Content-Length", 0))
+            payload = json.loads(self.rfile.read(ln).decode() or "{}")
+        except Exception:
+            self._send(400, json.dumps({"error": "invalid JSON"})); return
+        prompt = (payload.get("prompt") or "").strip()
+        if not prompt:
+            self._send(400, json.dumps({"error": "no prompt provided"})); return
+        data_url, err = generate(prompt[:2000])
+        if err:
+            self._send(502, json.dumps({"error": err})); return
+        self._send(200, json.dumps({"image": data_url, "model": MODEL}))
+    def log_message(self, *a):
+        pass
+
+def main():
+    print("FaB-Myth Image Host")
+    print("  model      : %s" % MODEL)
+    print("  binding    : %s:%d" % (HOST, PORT))
+    print("  public url : %s" % PUBLIC_URL)
+    print()
+    print("Paste this ONE tag into your website (no API key needed):")
+    print()
+    print("    " + EMBED_TAG)
+    print()
+    print("Preview / copy page: %s" % PUBLIC_URL)
+    print("Visitors generate images via this host -- they never download the model.")
+    print("Press Ctrl-C to stop.")
+    print()
+    try:
+        ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()
+    except KeyboardInterrupt:
+        print("\nStopped.")
+    except OSError as e:
+        sys.stderr.write("Could not bind %s:%d -- %s\n" % (HOST, PORT, e)); sys.exit(1)
+
+if __name__ == "__main__":
+    main()
+PYEOF
+
+  info "Starting FaB-Myth Image Host for $model"
+  FABMYTH_IMG_MODEL="$model" FABMYTH_IMG_PORT="$port" FABMYTH_IMG_HOST="$host" \
+  FABMYTH_IMG_URL="$url" OLLAMA_HOST="$OLLAMA_HOST" \
+  "$PYBIN" "$iweb_py"
+}
+
+# ---------------------------------------------------------------------------
+# Forever API — reusable API keys + a key-authenticated, multi-model server.
+# Keys persist across restarts and work from any device/website.
+# ---------------------------------------------------------------------------
+_write_apiserver_py() {
+  local api_py="$FABMYTH_HOME/apiserver.py"
+  cat > "$api_py" <<'PYEOF'
+#!/usr/bin/env python3
+"""FaB-Myth Forever API: key-authenticated, multi-model chat over HTTP.
+
+Modes (argv[1]): newkey <name> | rmkey <name> | listkeys | serve
+
+Keys live in $FABMYTH_HOME/api_keys.json and are reloaded on every request, so
+new keys work immediately and deleted keys stop working at once ("forever").
+"""
+import os, sys, json, time, socket, secrets
+import urllib.request, urllib.error
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+HOME = os.environ.get("FABMYTH_HOME", os.path.expanduser("~/.fabmyth"))
+KEYS_FILE = os.path.join(HOME, "api_keys.json")
+OHOST = os.environ.get("OLLAMA_HOST", "127.0.0.1:11434")
+OBASE = OHOST if OHOST.startswith("http") else "http://" + OHOST
+DEFAULT_MODEL = os.environ.get("FABMYTH_API_DEFAULT_MODEL", "llama3.2:1b")
+PORT = int(os.environ.get("FABMYTH_API_PORT", "8899"))
+HOST = os.environ.get("FABMYTH_API_HOST", "0.0.0.0")
+
+def load_keys():
+    try:
+        with open(KEYS_FILE) as f: return json.load(f)
+    except Exception:
+        return {}
+
+def save_keys(d):
+    tmp = KEYS_FILE + ".tmp"
+    with open(tmp, "w") as f: json.dump(d, f, indent=2)
+    os.replace(tmp, KEYS_FILE)
+
+def newkey(name):
+    if not name or not all(c.isalnum() or c in "-_." for c in name):
+        sys.stderr.write("Key name must be letters/digits/-_. only.\n"); sys.exit(1)
+    keys = load_keys()
+    if name in keys:
+        sys.stderr.write("A key named '%s' already exists. Remove it first: fabmyth API rm %s\n" % (name, name)); sys.exit(1)
+    key = "fmk_" + secrets.token_urlsafe(24)
+    keys[name] = {"key": key, "created": time.time()}
+    save_keys(keys)
+    print(key)  # raw key to stdout for scripting
+    sys.stderr.write("Created API key '%s'.\n" % name)
+
+def rmkey(name):
+    keys = load_keys()
+    if name in keys:
+        del keys[name]; save_keys(keys); print("Deleted key '%s'." % name)
+    else:
+        print("No key named '%s'." % name)
+
+def listkeys():
+    keys = load_keys()
+    if not keys:
+        print("No API keys yet. Create one:  fabmyth API <name>"); return
+    print("%-20s %-18s %s" % ("NAME", "KEY", "CREATED"))
+    for name, v in sorted(keys.items()):
+        k = v.get("key", "")
+        masked = (k[:8] + "..." + k[-4:]) if len(k) > 14 else k
+        when = time.strftime("%Y-%m-%d", time.localtime(v.get("created", 0)))
+        print("%-20s %-18s %s" % (name, masked, when))
+
+def valid_key(key):
+    return bool(key) and any(v.get("key") == key for v in load_keys().values())
+
+def ollama_chat(model, messages):
+    data = json.dumps({"model": model, "messages": messages, "stream": False}).encode()
+    req = urllib.request.Request(OBASE + "/api/chat", data=data, headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=600) as r:
+        return json.loads(r.read().decode())["message"]["content"]
+
+class Handler(BaseHTTPRequestHandler):
+    def _cors(self):
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
+        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, X-API-Key")
+    def _send(self, code, obj):
+        body = json.dumps(obj).encode()
+        self.send_response(code); self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body))); self._cors(); self.end_headers()
+        self.wfile.write(body)
+    def _key(self, payload):
+        h = self.headers.get("Authorization", "")
+        if h.lower().startswith("bearer "): return h[7:].strip()
+        xk = self.headers.get("X-API-Key")
+        if xk: return xk.strip()
+        return (payload.get("key") or "").strip()
+    def do_OPTIONS(self):
+        self.send_response(204); self._cors(); self.end_headers()
+    def do_GET(self):
+        if self.path.split("?")[0] == "/health":
+            self._send(200, {"ok": True, "default_model": DEFAULT_MODEL})
+        else:
+            self._send(404, {"error": "not found"})
+    def do_POST(self):
+        if self.path.split("?")[0] not in ("/v1/chat", "/api/chat"):
+            self._send(404, {"error": "not found"}); return
+        try:
+            ln = int(self.headers.get("Content-Length", 0))
+            payload = json.loads(self.rfile.read(ln).decode() or "{}")
+        except Exception:
+            self._send(400, {"error": "invalid JSON"}); return
+        if not valid_key(self._key(payload)):
+            self._send(401, {"error": "invalid or missing API key"}); return
+        model = (payload.get("model") or "default").strip()
+        if model in ("", "default"): model = DEFAULT_MODEL
+        messages = []
+        if payload.get("system"):
+            messages.append({"role": "system", "content": str(payload["system"])[:8000]})
+        hist = payload.get("history") or payload.get("messages") or []
+        if isinstance(hist, list):
+            for m in hist[-20:]:
+                if isinstance(m, dict) and m.get("role") in ("user", "assistant") and m.get("content"):
+                    messages.append({"role": m["role"], "content": str(m["content"])[:8000]})
+        if payload.get("message"):
+            messages.append({"role": "user", "content": str(payload["message"])[:8000]})
+        if not messages or messages[-1]["role"] != "user":
+            self._send(400, {"error": "no user message"}); return
+        try:
+            reply = ollama_chat(model, messages)
+        except urllib.error.HTTPError as e:
+            self._send(502, {"error": "model error (is '%s' installed on the host?): %s" % (model, e)}); return
+        except urllib.error.URLError as e:
+            self._send(502, {"error": "ollama unreachable: %s" % e}); return
+        except Exception as e:
+            self._send(502, {"error": str(e)}); return
+        self._send(200, {"reply": reply, "model": model})
+    def log_message(self, *a): pass
+
+def guess_ip():
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.connect(("8.8.8.8", 80))
+        ip = s.getsockname()[0]; s.close(); return ip
+    except Exception:
+        return "127.0.0.1"
+
+def serve():
+    url = os.environ.get("FABMYTH_API_URL", "").rstrip("/")
+    if not url:
+        ip = guess_ip() if HOST in ("0.0.0.0", "::", "") else HOST
+        url = "http://%s:%d" % (ip, PORT)
+    print("FaB-Myth Forever API")
+    print("  endpoint      : POST %s/v1/chat" % url)
+    print("  default model : %s" % DEFAULT_MODEL)
+    print("  active keys   : %d  (%s)" % (len(load_keys()), KEYS_FILE))
+    print("  auth          : Authorization: Bearer <key>  (or X-API-Key header, or body 'key')")
+    print()
+    print("Call it from any device/website with a key from `fabmyth API <name>`.")
+    print("Copy-paste examples: the examples/ folder in the repo. Ctrl-C to stop.")
+    print()
+    try:
+        ThreadingHTTPServer((HOST, PORT), Handler).serve_forever()
+    except KeyboardInterrupt:
+        print("\nStopped.")
+    except OSError as e:
+        sys.stderr.write("Could not bind %s:%d -- %s\n" % (HOST, PORT, e)); sys.exit(1)
+
+MODE = sys.argv[1] if len(sys.argv) > 1 else "listkeys"
+ARG  = sys.argv[2] if len(sys.argv) > 2 else ""
+if __name__ == "__main__":
+    if   MODE == "newkey":   newkey(ARG)
+    elif MODE == "rmkey":    rmkey(ARG)
+    elif MODE == "listkeys": listkeys()
+    elif MODE == "serve":    serve()
+    else: sys.stderr.write("unknown mode: %s\n" % MODE); sys.exit(2)
+PYEOF
+}
+
+cmd_api() {
+  local PYBIN
+  if have python3; then PYBIN=python3
+  elif have python; then PYBIN=python
+  else die "The Forever API needs Python. Install it:  pkg install python  |  apt install python3"
+  fi
+  _write_apiserver_py
+  local api_py="$FABMYTH_HOME/apiserver.py"
+  local sub="${1:-help}"
+  case "$sub" in
+    help|-h|--help)
+      say "${C_BOLD}Forever API${C_RESET} — reusable key you can call from any site or device."
+      say ""
+      say "  fabmyth API <name>        create an API key (prints the key once)"
+      say "  fabmyth API list          list your keys"
+      say "  fabmyth API rm <name>     delete a key"
+      say "  fabmyth API serve [opts]  run the API server  (--port --host --url)"
+      say ""
+      say "Request body: ${C_DIM}{\"key\":\"<key>\",\"model\":\"default\",\"message\":\"hi\"}${C_RESET}"
+      say "  model \"default\" -> ${FABMYTH_API_DEFAULT_MODEL:-llama3.2:1b}; or any model you've pulled."
+      say "Copy-paste examples (HTML, JS, Python): the ${C_BOLD}examples/${C_RESET} folder in the repo."
+      ;;
+    rm|remove|delete)
+      shift; [ $# -ge 1 ] || die "Usage: fabmyth API rm <name>"
+      FABMYTH_HOME="$FABMYTH_HOME" "$PYBIN" "$api_py" rmkey "$1" ;;
+    ls|list)
+      FABMYTH_HOME="$FABMYTH_HOME" "$PYBIN" "$api_py" listkeys ;;
+    serve|server|start)
+      shift
+      local port="8899" host="0.0.0.0" url=""
+      while [ $# -gt 0 ]; do
+        case "$1" in
+          --port) port="${2:?--port needs a value}"; shift 2 ;; --port=*) port="${1#*=}"; shift ;;
+          --host) host="${2:?--host needs a value}"; shift 2 ;; --host=*) host="${1#*=}"; shift ;;
+          --url)  url="${2:?--url needs a value}"; shift 2 ;;  --url=*)  url="${1#*=}"; shift ;;
+          *) die "Unknown option: $1" ;;
+        esac
+      done
+      ensure_server
+      info "Starting Forever API server"
+      FABMYTH_HOME="$FABMYTH_HOME" FABMYTH_API_PORT="$port" FABMYTH_API_HOST="$host" \
+      FABMYTH_API_URL="$url" OLLAMA_HOST="$OLLAMA_HOST" "$PYBIN" "$api_py" serve ;;
+    *)
+      # Any other token is a key name to create.
+      local key
+      key="$(FABMYTH_HOME="$FABMYTH_HOME" "$PYBIN" "$api_py" newkey "$sub")" || return 1
+      ok "API key '$sub' created:"
+      say "  ${C_BOLD}$key${C_RESET}"
+      say ""
+      say "Use it as the \"key\" field in the JSON body, or header: Authorization: Bearer $key"
+      say "Start the server:  ${C_BOLD}fabmyth API serve${C_RESET}"
+      say "Then see the ${C_BOLD}examples/${C_RESET} folder for HTML / JS / Python usage."
+      ;;
+  esac
+}
+
+# ---------------------------------------------------------------------------
+# Site builder — generate a ready-to-host chat website (no coding needed).
+# ---------------------------------------------------------------------------
+cmd_site() {
+  local model="default" out="./fabmyth-site" api="" key="" title="FaB-Myth Chat"
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --out) out="${2:?--out needs a value}"; shift 2 ;; --out=*) out="${1#*=}"; shift ;;
+      --api|--url) api="${2:?--api needs a value}"; shift 2 ;; --api=*|--url=*) api="${1#*=}"; shift ;;
+      --key) key="${2:?--key needs a value}"; shift 2 ;; --key=*) key="${1#*=}"; shift ;;
+      --title) title="${2:?--title needs a value}"; shift 2 ;; --title=*) title="${1#*=}"; shift ;;
+      -*) die "Unknown option: $1" ;;
+      *) model="$1"; shift ;;
+    esac
+  done
+  mkdir -p "$out" || die "Can't create output dir: $out"
+
+  local endpoint
+  if [ -n "$key" ]; then
+    api="${api:-http://YOUR_HOST:8899}"; endpoint="$api/v1/chat"
+  else
+    api="${api:-http://YOUR_HOST:8777}"; endpoint="$api/api/chat"
+  fi
+
+  cat > "$out/index.html" <<'HTMLEOF'
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>__TITLE__</title>
+<style>
+  :root{color-scheme:light dark;--accent:#4f46e5}
+  *{box-sizing:border-box}
+  html,body{height:100%;margin:0}
+  body{font-family:system-ui,-apple-system,"Segoe UI",Roboto,sans-serif;background:#f6f7f9;color:#14151a;display:flex;flex-direction:column}
+  header{background:var(--accent);color:#fff;padding:14px 18px;font-weight:600;font-size:1.1rem}
+  #chat{flex:1;overflow-y:auto;padding:18px;display:flex;flex-direction:column;gap:10px;max-width:820px;width:100%;margin:0 auto}
+  .m{max-width:80%;padding:10px 13px;border-radius:14px;line-height:1.45;white-space:pre-wrap;word-wrap:break-word}
+  .u{align-self:flex-end;background:var(--accent);color:#fff;border-bottom-right-radius:4px}
+  .a{align-self:flex-start;background:#fff;border:1px solid #e5e7eb;border-bottom-left-radius:4px}
+  footer{border-top:1px solid #e5e7eb;background:#fff;padding:12px;display:flex;gap:8px;max-width:820px;width:100%;margin:0 auto}
+  #in{flex:1;border:1px solid #d1d5db;border-radius:12px;padding:12px 14px;font-size:15px;outline:none}
+  #send{border:none;background:var(--accent);color:#fff;border-radius:12px;padding:0 18px;font-size:15px;cursor:pointer}
+  #send:disabled{opacity:.6;cursor:default}
+  @media(prefers-color-scheme:dark){body{background:#0f1012;color:#e6e7ea}.a{background:#1b1c1f;border-color:#2a2b30}footer{background:#141518;border-color:#2a2b30}#in{background:#1b1c1f;color:#e6e7ea;border-color:#2a2b30}}
+</style>
+</head>
+<body>
+<header>__TITLE__</header>
+<div id="chat"></div>
+<footer>
+  <input id="in" placeholder="Type a message..." autofocus>
+  <button id="send">Send</button>
+</footer>
+<script>
+  var ENDPOINT = "__ENDPOINT__";
+  var APIKEY   = "__KEY__";
+  var MODEL    = "__MODEL__";
+  var history  = [];
+  var chat = document.getElementById('chat');
+  var input = document.getElementById('in');
+  var sendb = document.getElementById('send');
+  function add(role, text){
+    var d = document.createElement('div');
+    d.className = 'm ' + (role === 'user' ? 'u' : 'a');
+    d.textContent = text; chat.appendChild(d); chat.scrollTop = chat.scrollHeight; return d;
+  }
+  var busy = false;
+  function send(){
+    var text = (input.value || '').trim(); if(!text || busy) return;
+    input.value = ''; add('user', text); history.push({role:'user', content:text});
+    busy = true; sendb.disabled = true;
+    var typing = add('assistant', '...');
+    var headers = {'Content-Type':'application/json'};
+    if(APIKEY){ headers['Authorization'] = 'Bearer ' + APIKEY; }
+    var body = {message:text, history:history.slice(0,-1), model:MODEL};
+    if(APIKEY){ body.key = APIKEY; }
+    fetch(ENDPOINT, {method:'POST', headers:headers, body:JSON.stringify(body)})
+      .then(function(r){return r.json();})
+      .then(function(j){
+        var reply = j.reply || ('[error] ' + (j.error || 'no response'));
+        typing.textContent = reply; history.push({role:'assistant', content:reply});
+      })
+      .catch(function(e){ typing.textContent = '[network error] ' + e; })
+      .then(function(){ busy = false; sendb.disabled = false; input.focus(); });
+  }
+  sendb.onclick = send;
+  input.addEventListener('keydown', function(e){ if(e.key === 'Enter'){ e.preventDefault(); send(); }});
+</script>
+</body>
+</html>
+HTMLEOF
+
+  # Fill in the template (| delimiter so URLs/model slashes are safe).
+  sed -i \
+    -e "s|__ENDPOINT__|$endpoint|g" \
+    -e "s|__MODEL__|$model|g" \
+    -e "s|__KEY__|$key|g" \
+    -e "s|__TITLE__|$title|g" \
+    "$out/index.html"
+
+  ok "Website generated → $out/index.html"
+  say "  API endpoint : $endpoint"
+  say "  model        : $model"
+  [ -n "$key" ] && say "  API key      : embedded" || say "  auth         : none (plain Web API)"
+  say ""
+  say "Open it locally, or host the folder anywhere (GitHub Pages, Netlify, a USB stick)."
+  if printf '%s' "$endpoint" | grep -q "YOUR_HOST"; then
+    warn "Edit the endpoint or re-run with --api http://<your-host>:<port> so other devices can reach it."
+  fi
+}
+
 cmd_list() {
   ensure_server
   ollama list
@@ -1089,7 +1744,9 @@ llama3.1:8b||~4.7GB|Higher quality, needs a beefier device
 mistral:7b||~4.1GB|Popular 7B general model
 qwen2.5-coder:7b||~4.7GB|Strong coding assistant
 deepseek-r1:7b||~4.7GB|Reasoning model, larger variant
-llava:7b||~4.5GB|Vision + language (describe images)"
+llava:7b||~4.5GB|Vision + language (describe images)
+x/z-image-turbo:fp8||~13GB|Text-to-IMAGE generation (use: fabmyth image) — macOS only for now
+x/z-image-turbo:bf16||~33GB|Text-to-IMAGE, highest quality (fabmyth image) — macOS only"
 
   local shown=0
   while IFS='|' read -r name star size desc; do
@@ -1264,6 +1921,13 @@ ${C_BOLD}Memory (per-model, persists across sessions)${C_RESET}
   memory show <model>     Print a model's stored conversation
   memory clear <model>    Erase one model's memory (or: memory clear --all)
 
+${C_BOLD}Images (experimental; Ollama image gen is macOS-only for now)${C_RESET}
+  image [model] "prompt"  Generate an image locally (default x/z-image-turbo:fp8)
+                          Saves to \$FABMYTH_IMAGE_DIR or the current directory
+  image-web [model]       Host an image model so others generate over HTTP
+                          (they never download it). Prints a <script> tag.
+                          Options: --port N  --host H  --url URL
+
 ${C_BOLD}Termux AgenticOS${C_RESET}
   agent <model> [task]  Let the model run shell / Python / JS and save files —
                         every action needs your approval. Files go to
@@ -1274,6 +1938,15 @@ ${C_BOLD}Web API (embed on a website)${C_RESET}
                         Prints one <script> tag to paste into your site (no
                         key). Chat-only — never runs commands.
                         Options: --port N  --host H  --url URL  --system TEXT
+  site [model] [opts]   Generate a ready-to-host chat WEBSITE (no coding).
+                        Options: --out DIR  --api URL  --key KEY  --title T
+
+${C_BOLD}Forever API (reusable API keys, any device/site)${C_RESET}
+  API <name>            Create a reusable API key
+  API list              List your keys
+  API rm <name>         Delete a key
+  API serve [opts]      Run the key-authenticated, multi-model API server
+                        (payload: {"key","model","message"}; see examples/)
 
 ${C_BOLD}Other${C_RESET}
   logs [-f|N]           Show server logs (-f to follow, N lines)
@@ -1309,8 +1982,12 @@ main() {
     chat)              cmd_chat "$@" ;;
     remember|memchat)  cmd_remember "$@" ;;
     memory|mem)        cmd_memory "$@" ;;
+    image|img|imagine) cmd_image "$@" ;;
+    image-web|imghost|webimage) cmd_image_web "$@" ;;
     agent|agentic|agenticos) cmd_agent "$@" ;;
-    web|api|webapi)    cmd_web "$@" ;;
+    web|webapi)        cmd_web "$@" ;;
+    API|api|apikey)    cmd_api "$@" ;;
+    site|website|build-site) cmd_site "$@" ;;
     list|ls)           cmd_list "$@" ;;
     ps)                cmd_ps "$@" ;;
     rm|remove)         cmd_rm "$@" ;;
