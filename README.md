@@ -92,6 +92,8 @@ On **Termux**, follow the dedicated walkthrough in
 | `fabmyth memory <list\|show\|clear>` | Manage saved memories |
 | `fabmyth agent <model> [task]` | **Termux AgenticOS** — let the model act on your device (see below) |
 | `fabmyth web <model> [opts]` | **Web API** — serve a model + embeddable chat widget for your site (see below) |
+| `fabmyth site [model] [opts]` | Generate a ready-to-host chat **website** (no coding) |
+| `fabmyth API <name>` | **Forever API** — reusable API key for any device/site (see below) |
 | `fabmyth update [--branch B]` | Self-update to the latest version |
 | `fabmyth logs [-f\|N]` | Show server logs |
 
@@ -143,6 +145,57 @@ This is the *only* real way to spare people the download: the weights live on
 your host (downloaded once), and everyone else just sends prompts. The same two
 caveats apply — the host needs the model, and until Ollama's image gen reaches
 Linux the host must be a Mac.
+
+## No-code website (`fabmyth site`)
+
+Don't want to write any HTML? Generate a complete chat website in one command:
+
+```bash
+fabmyth site --api http://192.168.1.50:8777        # plain Web API
+# or point it at the Forever API with a key:
+fabmyth site qwen2.5:3b --api http://192.168.1.50:8899 --key fmk_... --title "My Bot"
+```
+
+It writes a self-contained `index.html` (a full-page chat UI) to
+`./fabmyth-site/` (or `--out DIR`). Host that folder anywhere — GitHub Pages,
+Netlify, a USB stick — no build step, no dependencies. Options: `--out`, `--api`,
+`--key`, `--title`.
+
+## Forever API — one key, any device or site
+
+The Web API is single-model and keyless. The **Forever API** gives you a
+**reusable key** that works from any website or device, and lets callers pick
+which model to use.
+
+```bash
+fabmyth API mykey        # create a key -> prints fmk_XXXXXXXX... (once)
+fabmyth API list         # list your keys (secret masked)
+fabmyth API rm mykey     # delete a key
+fabmyth API serve        # run the key-authenticated server (port 8899)
+```
+
+Call it from anywhere with a JSON body:
+
+```json
+{ "key": "fmk_...", "model": "default", "message": "Hello!" }
+```
+
+- **`model`** — `"default"` uses `llama3.2:1b`; or name any model you've pulled
+  on the host (e.g. `"qwen2.5:3b"`), so **one key can serve several models** you
+  host.
+- The key can be sent in the body (`"key"`) or as an `Authorization: Bearer ...`
+  header. Invalid/missing keys get HTTP 401. Keys are reloaded on every request,
+  so new keys work instantly and deleted keys stop working immediately.
+
+Ready-made **examples** (HTML, JavaScript, and Python with `requests`) live in
+the [`examples/`](examples/) folder — copy one, drop in your `API_URL` and
+`API_KEY`, done.
+
+> Keys are stored on the host in `~/.fabmyth/api_keys.json`. The server binds to
+> all interfaces so other devices on your network can reach it; for public use,
+> front it with an HTTPS tunnel and pass `--url`. There's no way around the host
+> needing to run — the key authenticates callers, it doesn't run the model
+> remotely by itself.
 
 ## Memory — models that remember you
 

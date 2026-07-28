@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>FaB-Myth Forever API — browser example</title>
+</head>
+<body>
+  <h1>Ask the AI</h1>
+  <input id="msg" placeholder="Type a question" style="width:70%">
+  <button id="go">Send</button>
+  <pre id="out"></pre>
+
+  <script>
+    // ---- configure these two ----
+    const API_URL = "http://YOUR_HOST:8899/v1/chat";   // your `fabmyth API serve` address
+    const API_KEY = "fmk_REPLACE_WITH_YOUR_KEY";        // from `fabmyth API <name>`
+    // -----------------------------
+
+    const out = document.getElementById("out");
+
+    async function ask(message) {
+      out.textContent = "…thinking…";
+      try {
+        const res = await fetch(API_URL, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": "Bearer " + API_KEY
+          },
+          body: JSON.stringify({
+            key: API_KEY,          // key can go in the header, or here in the body
+            model: "default",      // "default" -> llama3.2:1b, or any model you've pulled
+            message: message
+          })
+        });
+        const data = await res.json();
+        out.textContent = data.reply || ("Error: " + (data.error || "unknown"));
+      } catch (e) {
+        out.textContent = "Network error: " + e;
+      }
+    }
+
+    document.getElementById("go").onclick = () => ask(document.getElementById("msg").value);
+  </script>
+</body>
+</html>
