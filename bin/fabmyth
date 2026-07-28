@@ -19,7 +19,7 @@
 # MIT License — Copyright (c) 2026 Trey16885
 set -euo pipefail
 
-FABMYTH_VERSION="0.5.0"
+FABMYTH_VERSION="0.6.0"
 
 # ---------------------------------------------------------------------------
 # Colors (disabled when not a TTY or NO_COLOR is set)
@@ -1050,6 +1050,70 @@ cmd_memory() {
   esac
 }
 
+# ---------------------------------------------------------------------------
+# Image generation — wraps Ollama's (experimental) text-to-image support.
+# Models like x/z-image-turbo:fp8 (13GB) / :bf16 (33GB). NOTE: as of 2026
+# Ollama image generation is macOS-only; Linux/Termux support is pending.
+# ---------------------------------------------------------------------------
+cmd_image() {
+  ensure_server
+
+  # First token is the model only if it looks like a bare model ref (no spaces);
+  # otherwise everything is the prompt and we use a default image model.
+  local model
+  if [ $# -ge 2 ] && printf '%s' "$1" | grep -qE '^[A-Za-z0-9._/-]+(:[A-Za-z0-9._-]+)?$'; then
+    model="$1"; shift
+  else
+    model="${FABMYTH_IMAGE_MODEL:-x/z-image-turbo:fp8}"
+  fi
+  local prompt="$*"
+  [ -n "$prompt" ] || die "Usage: fabmyth image [model] \"<prompt>\"   (e.g. fabmyth image \"a red fox in snow\")"
+
+  # Platform reality check (don't hard-block — the situation is evolving).
+  if [ "$(uname -s)" != "Darwin" ]; then
+    warn "Ollama image generation is currently macOS-only (experimental)."
+    warn "On $(platform_label) this may fail until Ollama ships Linux support — trying anyway."
+  fi
+
+  # These models are big; never auto-pull tens of GB. Ask the user to opt in.
+  if ! ollama list 2>/dev/null | awk 'NR>1{print $1}' | grep -qx "$model"; then
+    err "'$model' isn't installed."
+    say "  Image models are large (x/z-image-turbo:fp8 ~13GB, :bf16 ~33GB)."
+    say "  Download it explicitly when you're ready:"
+    say "     ${C_BOLD}fabmyth pull $model${C_RESET}"
+    return 1
+  fi
+
+  local outdir="${FABMYTH_IMAGE_DIR:-$PWD}"
+  mkdir -p "$outdir" 2>/dev/null || die "Can't write to output dir: $outdir"
+
+  info "Generating with $model → $outdir"
+  say  "  prompt: $prompt"
+
+  # Ollama saves generated images into the working directory; run there and
+  # diff the listing to report exactly what was created.
+  local before after
+  before="$(ls -1 "$outdir" 2>/dev/null | sort)"
+  ( cd "$outdir" && ollama run "$model" "$prompt" )
+  local rc=$?
+  after="$(ls -1 "$outdir" 2>/dev/null | sort)"
+
+  local newfiles
+  newfiles="$(comm -13 <(printf '%s\n' "$before") <(printf '%s\n' "$after") \
+              | grep -iE '\.(png|jpg|jpeg|webp)$' || true)"
+  if [ -n "$newfiles" ]; then
+    ok "Created:"
+    printf '%s\n' "$newfiles" | while IFS= read -r f; do [ -n "$f" ] && say "  $outdir/$f"; done
+  elif [ "$rc" != 0 ]; then
+    err "Image generation failed (exit $rc)."
+    say "  If you're on Linux/Termux, Ollama's image support likely isn't available yet."
+  else
+    warn "No new image files detected in $outdir."
+    say  "  The model may have printed output inline, or saved elsewhere — check above."
+  fi
+  return "$rc"
+}
+
 cmd_list() {
   ensure_server
   ollama list
@@ -1089,7 +1153,9 @@ llama3.1:8b||~4.7GB|Higher quality, needs a beefier device
 mistral:7b||~4.1GB|Popular 7B general model
 qwen2.5-coder:7b||~4.7GB|Strong coding assistant
 deepseek-r1:7b||~4.7GB|Reasoning model, larger variant
-llava:7b||~4.5GB|Vision + language (describe images)"
+llava:7b||~4.5GB|Vision + language (describe images)
+x/z-image-turbo:fp8||~13GB|Text-to-IMAGE generation (use: fabmyth image) — macOS only for now
+x/z-image-turbo:bf16||~33GB|Text-to-IMAGE, highest quality (fabmyth image) — macOS only"
 
   local shown=0
   while IFS='|' read -r name star size desc; do
@@ -1264,6 +1330,10 @@ ${C_BOLD}Memory (per-model, persists across sessions)${C_RESET}
   memory show <model>     Print a model's stored conversation
   memory clear <model>    Erase one model's memory (or: memory clear --all)
 
+${C_BOLD}Images (experimental; Ollama image gen is macOS-only for now)${C_RESET}
+  image [model] "prompt"  Generate an image (default model x/z-image-turbo:fp8)
+                          Saves to \$FABMYTH_IMAGE_DIR or the current directory
+
 ${C_BOLD}Termux AgenticOS${C_RESET}
   agent <model> [task]  Let the model run shell / Python / JS and save files —
                         every action needs your approval. Files go to
@@ -1309,6 +1379,7 @@ main() {
     chat)              cmd_chat "$@" ;;
     remember|memchat)  cmd_remember "$@" ;;
     memory|mem)        cmd_memory "$@" ;;
+    image|img|imagine) cmd_image "$@" ;;
     agent|agentic|agenticos) cmd_agent "$@" ;;
     web|api|webapi)    cmd_web "$@" ;;
     list|ls)           cmd_list "$@" ;;

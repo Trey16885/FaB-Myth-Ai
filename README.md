@@ -87,6 +87,7 @@ On **Termux**, follow the dedicated walkthrough in
 | `fabmyth chat` | Pick an installed model and chat |
 | `fabmyth list` / `ps` | List installed / running models |
 | `fabmyth rm <model>` | Remove a model |
+| `fabmyth image [model] "prompt"` | Generate images with Ollama's image models (see below) |
 | `fabmyth remember <model> [msg]` | Chat with **persistent per-model memory** (see below) |
 | `fabmyth memory <list\|show\|clear>` | Manage saved memories |
 | `fabmyth agent <model> [task]` | **Termux AgenticOS** — let the model act on your device (see below) |
@@ -95,6 +96,32 @@ On **Termux**, follow the dedicated walkthrough in
 | `fabmyth logs [-f\|N]` | Show server logs |
 
 Run `fabmyth help` for the full list.
+
+## Image generation
+
+`fabmyth image` wraps Ollama's (experimental) text-to-image support, so you can
+generate pictures from a prompt with models like **`x/z-image-turbo`**:
+
+```bash
+fabmyth pull x/z-image-turbo:fp8          # 13GB (fp8); :bf16 is 33GB, higher quality
+fabmyth image "a red fox asleep in the snow, golden hour"
+# or name the model explicitly:
+fabmyth image x/z-image-turbo:fp8 "a neon city street in the rain"
+```
+
+Images are saved to `$FABMYTH_IMAGE_DIR` (defaults to the current directory),
+and `fabmyth image` reports exactly which files were created.
+
+> **Two honest caveats:**
+> 1. **Ollama's image generation is macOS-only right now** (experimental, added
+>    Jan 2026). On **Linux/Termux** — FaB-Myth's main target — it won't generate
+>    until Ollama ships Linux support. `fabmyth image` warns you and still tries,
+>    so it lights up automatically once that lands.
+> 2. **There's no way to run a model without its weights.** The host downloads
+>    the model once (13GB fp8). "Nobody downloads it" is only achievable by
+>    running it on one machine and calling it remotely — not by skipping the
+>    weights. Image models are **not auto-pulled** (they're too big); you pull
+>    them deliberately.
 
 ## Memory — models that remember you
 
