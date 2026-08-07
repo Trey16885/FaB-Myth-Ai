@@ -88,6 +88,7 @@ On **Termux**, follow the dedicated walkthrough in
 | `fabmyth list` / `ps` | List installed / running models |
 | `fabmyth rm <model>` | Remove a model |
 | `fabmyth image [model] "prompt"` | Generate images with Ollama's image models (see below) |
+| `fabmyth collab "m1 m2 …"` | 2–10 models **collaborate** on a task (see below) |
 | `fabmyth remember <model> [msg]` | Chat with **persistent per-model memory** (see below) |
 | `fabmyth memory <list\|show\|clear>` | Manage saved memories |
 | `fabmyth agent <model> [task]` | **Termux AgenticOS** — let the model act on your device (see below) |
@@ -196,6 +197,30 @@ the [`examples/`](examples/) folder — copy one, drop in your `API_URL` and
 > front it with an HTTPS tunnel and pass `--url`. There's no way around the host
 > needing to run — the key authenticates callers, it doesn't run the model
 > remotely by itself.
+
+## Collab — models working together
+
+`fabmyth collab` puts **2 to 10 models** on the same task. Each one reads the
+discussion so far (the task plus every prior model's contribution) and adds its
+own — then the first model synthesizes a single final answer.
+
+```bash
+fabmyth collab "llama3.2:1b qwen2.5:1.5b gemma2:2b"
+# or list them as separate arguments:
+fabmyth collab llama3.2:3b qwen2.5:3b
+# multiple passes so they iterate on each other, no final merge:
+fabmyth collab llama3.2:3b qwen2.5:3b --rounds 3 --no-synth
+```
+
+- **2–10 models** (it refuses fewer or more). Any model you've pulled works;
+  missing ones are pulled first.
+- `--rounds N` (1–5) makes them go around N times, each seeing the latest state.
+- `--no-synth` skips the final synthesized answer.
+- In-session: `/rounds N`, `/synth on|off`, `/bye`.
+
+Models don't share weights or memory — it's a conversation orchestrated across
+each model's API, so a small model can hand off to a stronger one and vice
+versa.
 
 ## Memory — models that remember you
 

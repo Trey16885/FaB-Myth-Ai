@@ -19,7 +19,7 @@
 # MIT License — Copyright (c) 2026 Trey16885
 set -euo pipefail
 
-FABMYTH_VERSION="0.8.0"
+FABMYTH_VERSION="0.9.0"
 
 # ---------------------------------------------------------------------------
 # Colors (disabled when not a TTY or NO_COLOR is set)
@@ -1705,6 +1705,153 @@ HTMLEOF
   fi
 }
 
+# ---------------------------------------------------------------------------
+# Collab — 2 to 10 models work a task together, each building on the others,
+# with an optional final synthesis.
+# ---------------------------------------------------------------------------
+cmd_collab() {
+  ensure_server
+  local rounds=1 synth=1
+  local models=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --rounds)   rounds="${2:?--rounds needs a value}"; shift 2 ;;
+      --rounds=*) rounds="${1#*=}"; shift ;;
+      --no-synth) synth=0; shift ;;
+      -*)         die "Unknown option: $1" ;;
+      *)          # split a quoted "m1 m2" form into separate models
+                  local toks; read -ra toks <<< "$1"; models+=("${toks[@]}"); shift ;;
+    esac
+  done
+
+  local n=${#models[@]}
+  [ "$n" -ge 2 ] || die "collab needs at least 2 models:  fabmyth collab \"llama3.2:1b qwen2.5:1.5b\""
+  [ "$n" -le 10 ] || die "collab supports at most 10 models (you gave $n)."
+  case "$rounds" in ''|*[!0-9]*) die "--rounds must be a number" ;; esac
+  [ "$rounds" -ge 1 ] || rounds=1
+  if [ "$rounds" -gt 5 ]; then warn "Capping rounds at 5."; rounds=5; fi
+
+  local PYBIN
+  if have python3; then PYBIN=python3
+  elif have python; then PYBIN=python
+  else die "collab needs Python. Install it:  pkg install python  |  apt install python3"
+  fi
+
+  local installed m
+  installed="$(ollama list 2>/dev/null | awk 'NR>1{print $1}')"
+  for m in "${models[@]}"; do
+    if ! printf '%s\n' "$installed" | grep -qx "$m"; then
+      warn "'$m' isn't installed. Pulling it first…"
+      ollama pull "$m" || die "Could not pull $m"
+    fi
+  done
+
+  local collab_py="$FABMYTH_HOME/collab.py"
+  cat > "$collab_py" <<'PYEOF'
+#!/usr/bin/env python3
+"""FaB-Myth collab: 2-10 models collaborate on a task.
+
+Each model, in order, reads the shared discussion so far (the task plus every
+prior model's contribution) and adds its own. After the round(s), the first
+model synthesizes one final answer. Models never share weights or memory — this
+is purely a conversation orchestrated over each model's /api/chat.
+"""
+import os, sys, json
+import urllib.request, urllib.error
+
+HOST = os.environ.get("OLLAMA_HOST", "127.0.0.1:11434")
+BASE = HOST if HOST.startswith("http") else "http://" + HOST
+ROUNDS = int(os.environ.get("FABMYTH_COLLAB_ROUNDS", "1"))
+SYNTH  = os.environ.get("FABMYTH_COLLAB_SYNTH", "1") != "0"
+MODELS = [m for m in sys.argv[1:] if m]
+
+TTY = sys.stdout.isatty() and not os.environ.get("NO_COLOR")
+def _c(x): return x if TTY else ""
+R=_c("\033[0m"); B=_c("\033[1m"); DIM=_c("\033[2m")
+CYN=_c("\033[36m"); MAG=_c("\033[35m"); GRN=_c("\033[32m"); YEL=_c("\033[33m"); RED=_c("\033[31m")
+
+def chat(model, messages):
+    data = json.dumps({"model": model, "messages": messages, "stream": False}).encode()
+    req = urllib.request.Request(BASE + "/api/chat", data=data, headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=600) as r:
+        return json.loads(r.read().decode())["message"]["content"]
+
+def others_of(m):
+    o = [x for x in MODELS if x != m]
+    return ", ".join(dict.fromkeys(o)) or "no one else"
+
+def run_task(task):
+    transcript = "TASK:\n%s\n" % task
+    for rnd in range(ROUNDS):
+        if ROUNDS > 1:
+            print("\n%s--- round %d/%d ---%s" % (DIM, rnd + 1, ROUNDS, R))
+        for m in MODELS:
+            sysmsg = ("You are model '%s', collaborating with %s to solve the task. "
+                      "Read the discussion so far and add YOUR contribution: extend it, "
+                      "fill in gaps, or correct earlier mistakes. Be concise and avoid "
+                      "repeating what others already said." % (m, others_of(m)))
+            user = transcript + "\nAdd your contribution as %s:" % m
+            try:
+                reply = chat(m, [{"role": "system", "content": sysmsg},
+                                 {"role": "user", "content": user}]).strip()
+            except urllib.error.URLError as e:
+                reply = "[error reaching %s: %s]" % (m, e)
+            except Exception as e:
+                reply = "[error from %s: %s]" % (m, e)
+            print("\n%s[%s]%s\n%s" % (B + CYN, m, R, reply))
+            transcript += "\n[%s]:\n%s\n" % (m, reply)
+    if SYNTH and len(MODELS) >= 2:
+        editor = MODELS[0]
+        sysmsg = ("You are the editor. Combine the collaborators' contributions into ONE "
+                  "clear final answer to the task. Resolve contradictions, drop redundancy.")
+        user = transcript + "\nWrite the single best final answer:"
+        try:
+            final = chat(editor, [{"role": "system", "content": sysmsg},
+                                  {"role": "user", "content": user}]).strip()
+            print("\n%s=== FINAL (synthesized by %s) ===%s\n%s" % (B + GRN, editor, R, final))
+        except Exception as e:
+            print("\n%s[synthesis error: %s]%s" % (RED, e, R))
+
+def main():
+    global ROUNDS, SYNTH
+    print("%sFaB-Myth Collab%s  models: %s" % (B + MAG, R, ", ".join(MODELS)))
+    print("  %srounds=%d  synthesis=%s  |  commands: /bye  /rounds N  /synth on|off%s"
+          % (DIM, ROUNDS, "on" if SYNTH else "off", R))
+    print()
+    while True:
+        try:
+            task = input("%stask>%s " % (B + CYN, R)).strip()
+        except EOFError:
+            print(); break
+        if not task:
+            continue
+        if task in ("/bye", "/exit", "/quit"):
+            break
+        if task.startswith("/rounds"):
+            parts = task.split()
+            if len(parts) == 2 and parts[1].isdigit():
+                ROUNDS = max(1, min(5, int(parts[1]))); print("(rounds = %d)" % ROUNDS)
+            else:
+                print("usage: /rounds N")
+            continue
+        if task.startswith("/synth"):
+            SYNTH = "off" not in task; print("(synthesis %s)" % ("on" if SYNTH else "off")); continue
+        run_task(task)
+        print()
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("\nInterrupted.")
+PYEOF
+
+  local synlabel="on"; [ "$synth" = 0 ] && synlabel="off"
+  info "Collab with ${#models[@]} models: ${models[*]}  (rounds=$rounds, synthesis=$synlabel)"
+  FABMYTH_COLLAB_ROUNDS="$rounds" FABMYTH_COLLAB_SYNTH="$synth" OLLAMA_HOST="$OLLAMA_HOST" \
+    "$PYBIN" "$collab_py" "${models[@]}"
+}
+
 cmd_list() {
   ensure_server
   ollama list
@@ -1911,6 +2058,7 @@ ${C_BOLD}Models${C_RESET}
   pull <model>          Download a model (e.g. llama3.2:1b)
   run <model> [prompt]  Chat with a model (auto-pulls if missing)
   chat                  Pick an installed model and start chatting
+  collab "m1 m2 …"      2–10 models collaborate on a task (--rounds N, --no-synth)
   list                  List installed models
   ps                    Show currently running models
   rm <model>            Remove an installed model
@@ -1982,6 +2130,7 @@ main() {
     chat)              cmd_chat "$@" ;;
     remember|memchat)  cmd_remember "$@" ;;
     memory|mem)        cmd_memory "$@" ;;
+    collab|panel)      cmd_collab "$@" ;;
     image|img|imagine) cmd_image "$@" ;;
     image-web|imghost|webimage) cmd_image_web "$@" ;;
     agent|agentic|agenticos) cmd_agent "$@" ;;
